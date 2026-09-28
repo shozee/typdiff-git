@@ -440,7 +440,9 @@ Issues concerning Typst source parsing and text-diff rendering may belong upstre
 
 ## Contributing
 
-Bug reports and pull requests are welcome.
+Bug reports and pull requests are welcome. Forks and independent extensions of this project are even more welcome.
+This project was created primarily to address an urgent practical need: generating revision documents for an academic manuscript under a tight deadline. Please note that I am not a Rust expert, and much of the code was developed with the assistance of AI tools. The implementation may therefore contain unconventional design choices or areas that could benefit from review and improvement.
+Please test the tool carefully before using its output for important submissions.
 
 When reporting an issue, please include:
 
