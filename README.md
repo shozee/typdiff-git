@@ -78,7 +78,13 @@ git --version
 
 ## Installation
 
-Clone your `typdiff-git` repository and build the release binary:
+Install from crates.io:
+
+```bash
+cargo install typdiff-git
+```
+
+Or clone your repository and build the release binary:
 
 ```bash
 git clone https://github.com/YOUR_ACCOUNT/typdiff-git.git
@@ -457,4 +463,3 @@ Please do not include confidential manuscripts or unpublished data in public iss
 ## License
 
 Apache-2.0.
-
