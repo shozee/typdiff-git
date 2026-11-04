@@ -1838,6 +1838,12 @@ fn run_typdiff(old: &Path, new: &Path, target: &Path) -> Result<()> {
         return Err(error);
     }
 
+    let diff_output = fs::read_to_string(&temporary)
+        .with_context(|| format!("reading {}", temporary.display()))?;
+    let sanitized_output = repair_typdiff_brackets(&diff_output);
+    fs::write(&temporary, sanitized_output)
+        .with_context(|| format!("writing sanitized output to {}", temporary.display()))?;
+
     fs::rename(&temporary, target)
         .with_context(|| format!("replacing {} with visual diff", target.display()))?;
     let _ = fs::remove_file(old_sanitized);
@@ -1961,4 +1967,130 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
 
 fn absolute_output(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() { Ok(path.to_path_buf()) } else { Ok(std::env::current_dir()?.join(path)) }
+}
+
+fn repair_typdiff_brackets(source: &str) -> String {
+    let mut result = Vec::new();
+    for line in source.lines() {
+        result.push(fix_line_bracket_balance(line));
+    }
+    let mut joined = result.join("\n");
+    if source.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn fix_line_bracket_balance(line: &str) -> String {
+    let mut unescaped_open = 0usize;
+    let mut unescaped_close = 0usize;
+    let mut escaped = false;
+    for c in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == '[' {
+            unescaped_open += 1;
+        } else if c == ']' {
+            unescaped_close += 1;
+        }
+    }
+
+    if unescaped_open <= unescaped_close {
+        return line.to_string();
+    }
+
+    let mut excess = unescaped_open - unescaped_close;
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+    let mut in_diff = false;
+    let mut candidate_indices = Vec::new();
+
+    while i < n {
+        if chars[i] == '\\' && i + 1 < n {
+            i += 2;
+            continue;
+        }
+
+        let remaining: String = chars[i..].iter().take(15).collect();
+        if remaining.starts_with("#diff-deleted[") || remaining.starts_with("#diff-added[") {
+            in_diff = true;
+            i += "#diff-deleted[".len();
+            continue;
+        }
+
+        if in_diff {
+            if chars[i] == '[' {
+                let mut j = i.checked_sub(1);
+                while let Some(idx) = j {
+                    if chars[idx].is_whitespace() {
+                        j = idx.checked_sub(1);
+                    } else {
+                        break;
+                    }
+                }
+                let mut is_ident = false;
+                if let Some(mut idx) = j {
+                    while chars[idx].is_alphanumeric() || matches!(chars[idx], '_' | '-') {
+                        if let Some(prev) = idx.checked_sub(1) {
+                            idx = prev;
+                        } else {
+                            break;
+                        }
+                    }
+                    if chars[idx] == '#' {
+                        is_ident = true;
+                    }
+                }
+
+                if !is_ident {
+                    candidate_indices.push(i);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let mut to_escape = std::collections::BTreeSet::new();
+    for &idx in candidate_indices.iter().rev() {
+        if excess == 0 {
+            break;
+        }
+        to_escape.insert(idx);
+        excess -= 1;
+    }
+
+    let mut output = String::with_capacity(line.len() + to_escape.len());
+    for (idx, &c) in chars.iter().enumerate() {
+        if to_escape.contains(&idx) {
+            output.push('\\');
+        }
+        output.push(c);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repair_typdiff_brackets_unclosed() {
+        let broken = "one #diff-deleted[[]two three#diff-deleted[\\]] four";
+        let fixed = repair_typdiff_brackets(broken);
+        assert_eq!(fixed, "one #diff-deleted[\\[]two three#diff-deleted[\\]] four");
+    }
+
+    #[test]
+    fn test_repair_typdiff_brackets_balanced() {
+        let ok = "one #diff-deleted[[two]] four";
+        let fixed = repair_typdiff_brackets(ok);
+        assert_eq!(fixed, ok);
+    }
 }
