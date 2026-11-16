@@ -14,6 +14,7 @@ A Git-aware tool that generates full-document Typst revision PDFs with visual di
 - Show added and deleted text using typdiff markup
 - Embedded diff engine: Self-contained with no external `typdiff` CLI binary dependency
 - Improved block alignment: Accurately interleaves deleted paragraphs at their original locations rather than grouping them at the start of replaced blocks
+- Continuous watch mode (`-w`, `--watch`): Automatically detects file changes in your working tree and re-generates the diff PDF on save
 - Keep newly added cross-reference functions executable, such as `#Fig(<fig:example>)`
 - Mark newly added figures with a blue frame
 - Show modified figures vertically as **Previous version** and **Revised version**
@@ -142,6 +143,16 @@ typdiff-git submitted-version WORKTREE \
   --main main.typ \
   -o current-revision.pdf
 ```
+
+## Watch mode
+
+Pass `-w` or `--watch` to automatically monitor the repository for changes and re-generate the diff PDF whenever you save an edit:
+
+```bash
+typdiff-git ver2.1 WORKTREE -w
+```
+
+Watch mode continuously monitors tracked and untracked files in the repository (excluding `.git` and the output PDF), debounces rapid edits, and re-compiles the diff upon file changes without having to re-run the command manually. If a compilation error occurs, watch mode reports the error and continues watching for fixes.
 
 ## Multi-file Typst projects
 

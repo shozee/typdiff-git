@@ -15,6 +15,9 @@ pub struct Cli {
     /// Output PDF
     #[arg(short, long, default_value = "revision-diff.pdf")]
     pub output: PathBuf,
+    /// Watch repository for changes and rebuild continuously
+    #[arg(short, long)]
+    pub watch: bool,
     /// Repository path; defaults to the current directory
     #[arg(short = 'C', long)]
     pub repository: Option<PathBuf>,
