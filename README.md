@@ -1,8 +1,8 @@
 # typdiff-git
 
-A Git-aware wrapper for [sou1118/typdiff](https://github.com/sou1118/typdiff) that generates full-document Typst revision PDFs with visual diffs for text, figures, and subfigures.
+A Git-aware tool that generates full-document Typst revision PDFs with visual diffs for text, figures, and subfigures.
 
-`typdiff-git` compares two Git revisions, or a Git revision and the current working tree, then compiles the complete Typst project from its root document. Text changes are handled by `typdiff`, while added, modified, and deleted figures receive dedicated visual markers.
+`typdiff-git` compares two Git revisions, or a Git revision and the current working tree, then compiles the complete Typst project from its root document. Text diffing is performed directly in-process using an embedded and improved fork of the [sou1118/typdiff](https://github.com/sou1118/typdiff) engine, while added, modified, and deleted figures receive dedicated visual markers. No external `typdiff` CLI installation is required.
 
 ## Features
 
@@ -11,7 +11,9 @@ A Git-aware wrapper for [sou1118/typdiff](https://github.com/sou1118/typdiff) th
 - Include staged, unstaged, and non-ignored untracked files
 - Compile a complete multi-file Typst document from `main.typ`
 - Preserve document structure, references, numbering, bibliography, and page layout
-- Show added and deleted text using `typdiff` markup
+- Show added and deleted text using typdiff markup
+- Embedded diff engine: Self-contained with no external `typdiff` CLI binary dependency
+- Improved block alignment: Accurately interleaves deleted paragraphs at their original locations rather than grouping them at the start of replaced blocks
 - Keep newly added cross-reference functions executable, such as `#Fig(<fig:example>)`
 - Mark newly added figures with a blue frame
 - Show modified figures vertically as **Previous version** and **Revised version**
@@ -57,22 +59,16 @@ A deleted figure is represented near its former reference by a red notice contai
 ## Requirements
 
 - Git
-- Rust and Cargo
+- Rust and Cargo (for building from source)
 - [Typst](https://typst.app/)
-- [typdiff](https://github.com/sou1118/typdiff)
 - `tar`
 
-Install `typdiff` from crates.io:
+> **Note:** As of v0.8.0, `typdiff-git` bundles an internal fork of `typdiff`. You no longer need to install `typdiff` separately via `cargo install typdiff`.
 
-```bash
-cargo install typdiff
-```
-
-Make sure `typst`, `typdiff`, and `git` are available in `PATH`:
+Make sure `typst` and `git` are available in `PATH`:
 
 ```bash
 typst --version
-typdiff --version
 git --version
 ```
 
@@ -436,19 +432,25 @@ typdiff-git HEAD WORKTREE \
 
 ## Relationship to typdiff
 
-This project is not a fork of `typdiff`. It invokes `typdiff` as an external source-level diff engine and adds Git-aware project orchestration, full-document compilation, and visual figure comparison.
+Originally, `typdiff-git` operated as an external wrapper invoking `typdiff` CLI. To ensure deterministic execution, eliminate external binary dependencies, and fix critical diff alignment behaviors, `typdiff-git` now bundles an internal fork of the core diff engine from [sou1118/typdiff](https://github.com/sou1118/typdiff) (licensed under Apache-2.0).
+
+Key enhancements over upstream `typdiff v0.1.3`:
+- **In-process execution:** No external `typdiff` CLI binary installation or sub-process overhead; Typst parsing, diff calculation, and markup rendering happen entirely in memory within `typdiff-git`.
+- **Interleaved block alignment:** Fixed an issue in `process_replace` where deleted blocks in a multi-paragraph replacement region were emitted in bulk at the very beginning of the region. Deleted paragraphs are now correctly interleaved at their original relative positions between matched paragraphs.
+- **Label & bracket sanitization:** Automatically repairs trailing label placements (`repair_typdiff_labels`) and unbalanced brackets produced around diff markup so that the resulting Typst files compile seamlessly.
 
 Upstream project:
-
 - [sou1118/typdiff](https://github.com/sou1118/typdiff)
-
-Issues concerning Typst source parsing and text-diff rendering may belong upstream. Git revision handling, working-tree snapshots, full-project compilation, and figure lifecycle visualization are implemented in `typdiff-git`.
 
 ## Contributing
 
 Bug reports and pull requests are welcome. Forks and independent extensions of this project are even more welcome.
 This project was created primarily to address an urgent practical need: generating revision documents for an academic manuscript under a tight deadline. Please note that I am not a Rust expert, and much of the code was developed with the assistance of AI tools. The implementation may therefore contain unconventional design choices or areas that could benefit from review and improvement.
 Please test the tool carefully before using its output for important submissions.
+
+> **Where to contribute:**
+> - **Diff engine improvements:** If you have suggestions, fixes, or enhancements concerning general-purpose Typst source parsing, syntax tree handling, or text diff algorithms (the core diff engine), please consider contributing them directly to the upstream [sou1118/typdiff](https://github.com/sou1118/typdiff) repository so that the broader Typst community can benefit.
+> - **Git & project-level features:** Issues and pull requests related to Git revision orchestration, full-document multi-file compilation, figure lifecycle comparisons, and visual report generation should be opened in this repository.
 
 When reporting an issue, please include:
 

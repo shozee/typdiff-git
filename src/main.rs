@@ -1,6 +1,7 @@
 mod cli;
 mod git;
 mod tools;
+mod typdiff;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -1810,44 +1811,23 @@ fn run_typdiff(old: &Path, new: &Path, target: &Path) -> Result<()> {
     let (old_source, new_source) =
         neutralize_one_sided_references(&old_source, &new_source);
 
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("document.typ");
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let old_sanitized = parent.join(format!(".{file_name}.typdiff-old.typ"));
-    let new_sanitized = parent.join(format!(".{file_name}.typdiff-new.typ"));
-    let temporary = parent.join(format!(".{file_name}.typdiff-output.typ"));
+    let old_blocks: Vec<_> = typdiff::parse::parse(&old_source)
+        .into_iter()
+        .filter(|b| !matches!(b, typdiff::Block::Parbreak))
+        .collect();
+    let new_blocks: Vec<_> = typdiff::parse::parse(&new_source)
+        .into_iter()
+        .filter(|b| !matches!(b, typdiff::Block::Parbreak))
+        .collect();
 
-    fs::write(&old_sanitized, old_source)?;
-    fs::write(&new_sanitized, new_source)?;
+    let diff_results = typdiff::diff::diff(&old_blocks, &new_blocks);
+    let diff_output = typdiff::render::render(&diff_results);
 
-    let result = tools::run(
-        "typdiff",
-        [
-            old_sanitized.as_os_str(),
-            new_sanitized.as_os_str(),
-            OsStr::new("-o"),
-            temporary.as_os_str(),
-        ],
-    );
-    if let Err(error) = result {
-        let _ = fs::remove_file(&old_sanitized);
-        let _ = fs::remove_file(&new_sanitized);
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-
-    let diff_output = fs::read_to_string(&temporary)
-        .with_context(|| format!("reading {}", temporary.display()))?;
     let sanitized_output = repair_typdiff_brackets(&diff_output);
-    fs::write(&temporary, sanitized_output)
-        .with_context(|| format!("writing sanitized output to {}", temporary.display()))?;
+    let sanitized_output = repair_typdiff_labels(&sanitized_output);
 
-    fs::rename(&temporary, target)
-        .with_context(|| format!("replacing {} with visual diff", target.display()))?;
-    let _ = fs::remove_file(old_sanitized);
-    let _ = fs::remove_file(new_sanitized);
+    fs::write(target, sanitized_output)
+        .with_context(|| format!("writing visual diff to {}", target.display()))?;
     Ok(())
 }
 fn neutralize_one_sided_references(old: &str, new: &str) -> (String, String) {
@@ -2076,6 +2056,95 @@ fn fix_line_bracket_balance(line: &str) -> String {
     output
 }
 
+fn repair_typdiff_labels(source: &str) -> String {
+    let mut blocks = Vec::new();
+    let mut search_from = 0;
+    while search_from < source.len() {
+        let next_added = source[search_from..].find("#diff-added[").map(|i| search_from + i);
+        let next_deleted = source[search_from..].find("#diff-deleted[").map(|i| search_from + i);
+        let next_pos = match (next_added, next_deleted) {
+            (Some(a), Some(d)) => Some(a.min(d)),
+            (Some(a), None) => Some(a),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        };
+        let Some(pos) = next_pos else { break; };
+        let open_bracket = if source[pos..].starts_with("#diff-added[") {
+            pos + "#diff-added[".len() - 1
+        } else {
+            pos + "#diff-deleted[".len() - 1
+        };
+        if let Some(close_bracket) = find_matching_delimiter(source, open_bracket, '[', ']') {
+            blocks.push(close_bracket);
+            search_from = close_bracket + 1;
+        } else {
+            search_from = open_bracket + 1;
+        }
+    }
+
+    let mut result = source.to_string();
+    for close_bracket in blocks.into_iter().rev() {
+        let after = &result[close_bracket + 1..];
+        let chars: Vec<(usize, char)> = after.char_indices().collect();
+        let mut idx = 0;
+        let mut newlines = 0;
+        while idx < chars.len() {
+            let c = chars[idx].1;
+            if c == ' ' || c == '\t' {
+                idx += 1;
+            } else if c == '\n' || c == '\r' {
+                newlines += 1;
+                if newlines > 1 {
+                    break;
+                }
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        if newlines > 1 || idx >= chars.len() {
+            continue;
+        }
+
+        let mut labels = Vec::new();
+        let mut last_label_end_in_after = 0;
+        while idx < chars.len() && chars[idx].1 == '<' {
+            let label_start = chars[idx].0;
+            let mut cursor = idx + 1;
+            while cursor < chars.len() && is_label_char(chars[cursor].1) {
+                cursor += 1;
+            }
+            if cursor < chars.len() && chars[cursor].1 == '>' {
+                let label_end = chars[cursor].0 + 1;
+                labels.push(after[label_start..label_end].to_string());
+                last_label_end_in_after = label_end;
+                idx = cursor + 1;
+                while idx < chars.len() && (chars[idx].1 == ' ' || chars[idx].1 == '\t') {
+                    idx += 1;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if !labels.is_empty() {
+            let labels_str = labels.join("");
+            let had_space_before_label = chars[0].1 == ' ' || chars[0].1 == '\t';
+            let content_ends_with_space = result[..close_bracket].ends_with(char::is_whitespace);
+            let to_insert = if !content_ends_with_space && had_space_before_label {
+                format!(" {labels_str}")
+            } else {
+                labels_str
+            };
+
+            result.drain(close_bracket + 1..close_bracket + 1 + last_label_end_in_after);
+            result.insert_str(close_bracket, &to_insert);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2092,5 +2161,47 @@ mod tests {
         let ok = "one #diff-deleted[[two]] four";
         let fixed = repair_typdiff_brackets(ok);
         assert_eq!(fixed, ok);
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_after_added() {
+        let source = "#diff-deleted[#figure(old)]#diff-added[#figure(new)]<fig:test>";
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, "#diff-deleted[#figure(old)]#diff-added[#figure(new)<fig:test>]");
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_with_space() {
+        let source = "#diff-added[#figure(new) ] <fig:test>";
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, "#diff-added[#figure(new) <fig:test>]");
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_deleted_only() {
+        let source = "#diff-deleted[#figure(old)]<fig:old>";
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, "#diff-deleted[#figure(old)<fig:old>]");
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_nested_brackets() {
+        let source = "#diff-added[#figure(caption: [Short [nested] title])[body]]<fig:nested>";
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, "#diff-added[#figure(caption: [Short [nested] title])[body]<fig:nested>]");
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_no_label() {
+        let source = "#diff-added[hello world] next text";
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, source);
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_parbreak_ignored() {
+        let source = "#diff-added[hello]\n\n<fig:detached>";
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, source);
     }
 }
