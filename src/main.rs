@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
 #[derive(Clone, Debug)]
@@ -47,7 +48,6 @@ fn run() -> Result<()> {
     }
     repo.verify_revision(&cli.old)?;
     repo.verify_revision(&cli.new)?;
-    tools::require("typdiff")?;
     tools::require("typst")?;
     let image_functions = normalized_image_functions(&cli.image_functions)?;
 
@@ -55,7 +55,129 @@ fn run() -> Result<()> {
         .debug_dir
         .as_ref()
         .and_then(|path| repository_relative_path(repo.root(), path));
+    let output = absolute_output(&cli.output)?;
 
+    if cli.watch {
+        if !is_worktree(&cli.new) {
+            bail!("--watch requires the newer revision to be WORKTREE (or -)");
+        }
+        match generate_diff(&cli, &repo, &image_functions, &output, debug_repo_prefix.as_deref()) {
+            Ok(_) => {}
+            Err(e) => eprintln!("error building initial diff: {e:#}"),
+        }
+        eprintln!(
+            "Watching for changes in {}... (Press Ctrl+C to exit)",
+            repo.root().display()
+        );
+        watch_loop(
+            &cli,
+            &repo,
+            &image_functions,
+            &output,
+            debug_repo_prefix.as_deref(),
+        )?;
+    } else {
+        generate_diff(
+            &cli,
+            &repo,
+            &image_functions,
+            &output,
+            debug_repo_prefix.as_deref(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn watch_loop(
+    cli: &Cli,
+    repo: &Repository,
+    image_functions: &[String],
+    output: &Path,
+    debug_repo_prefix: Option<&Path>,
+) -> Result<()> {
+    let mut last_mtime = get_latest_mtime(repo.root(), output, cli.debug_dir.as_deref());
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let current_mtime = get_latest_mtime(repo.root(), output, cli.debug_dir.as_deref());
+        if current_mtime > last_mtime {
+            // Debounce to allow multiple quick saves / file system events to settle
+            std::thread::sleep(Duration::from_millis(150));
+            last_mtime = get_latest_mtime(repo.root(), output, cli.debug_dir.as_deref());
+            eprintln!("\nChange detected, updating {}...", output.display());
+            let start = Instant::now();
+            match generate_diff(cli, repo, image_functions, output, debug_repo_prefix) {
+                Ok(_) => {
+                    eprintln!(
+                        "Successfully updated {} in {:.2?}",
+                        output.display(),
+                        start.elapsed()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error updating diff: {e:#}");
+                }
+            }
+        }
+    }
+}
+
+fn get_latest_mtime(
+    root: &Path,
+    output: &Path,
+    debug_dir: Option<&Path>,
+) -> Option<SystemTime> {
+    let output_abs = output.canonicalize().ok().unwrap_or_else(|| output.to_path_buf());
+    let debug_abs = debug_dir.and_then(|d| d.canonicalize().ok().or_else(|| Some(d.to_path_buf())));
+
+    let mut latest = None;
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            let file_name = e.file_name().to_string_lossy();
+            if file_name == ".git"
+                || file_name == "target"
+                || file_name.starts_with(".#")
+                || file_name.ends_with('~')
+                || file_name.ends_with(".swp")
+                || file_name.ends_with(".tmp")
+            {
+                return false;
+            }
+            let path = e.path();
+            if path == output || path == output_abs || e.file_name() == output.file_name().unwrap_or_default() {
+                return false;
+            }
+            if let Some(debug) = &debug_abs {
+                if path == debug.as_path() {
+                    return false;
+                }
+            }
+            true
+        })
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    latest = match latest {
+                        None => Some(mtime),
+                        Some(prev) => Some(prev.max(mtime)),
+                    };
+                }
+            }
+        }
+    }
+    latest
+}
+
+fn generate_diff(
+    cli: &Cli,
+    repo: &Repository,
+    image_functions: &[String],
+    output: &Path,
+    debug_repo_prefix: Option<&Path>,
+) -> Result<()> {
     let (workspace, _temporary_guard) = if let Some(debug_dir) = &cli.debug_dir {
         let debug_dir = absolute_output(debug_dir)?;
         if debug_dir.exists() {
@@ -69,7 +191,9 @@ fn run() -> Result<()> {
     } else {
         let temporary = TempDir::new().context("creating temporary workspace")?;
         let path = temporary.path().to_path_buf();
-        eprintln!("temporary workspace: {} (removed when the command exits)", path.display());
+        if !cli.watch {
+            eprintln!("temporary workspace: {} (removed when the command exits)", path.display());
+        }
         (path, Some(temporary))
     };
     let old_tree = workspace.join("old");
@@ -84,7 +208,7 @@ fn run() -> Result<()> {
     // custom wrapper. This is more reliable than asset-only detection for Added figures.
     let old_figure_labels: BTreeSet<String> = collect_figure_definitions(
         &old_tree,
-        &image_functions,
+        image_functions,
     )?
     .into_iter()
     .map(|definition| definition.label)
@@ -110,14 +234,14 @@ fn run() -> Result<()> {
 
     let mut changes = repo.changed_typst_files(&cli.old, &cli.new)?;
     changes.retain(|change| {
-        cli.matches(change) && !change_is_below(change, debug_repo_prefix.as_deref())
+        cli.matches(change) && !change_is_below(change, debug_repo_prefix)
     });
 
     // Prepare and rewrite changed figure assets before running typdiff.  This is
     // important for newly-added figures: once typdiff has wrapped a newly-added
     // figure block, reliably rewriting its image path becomes much harder.
     let mut figures = repo.changed_figure_files(&cli.old, &cli.new)?;
-    figures.retain(|change| !change_is_below(change, debug_repo_prefix.as_deref()));
+    figures.retain(|change| !change_is_below(change, debug_repo_prefix));
     let mut marked_figures = prepare_figure_comparisons(
         &figures,
         &old_tree,
@@ -135,7 +259,7 @@ fn run() -> Result<()> {
         &new_tree,
         &report_tree,
         &workspace,
-        &image_functions,
+        image_functions,
         &mut marked_figures,
         &mut modified_figure_assets,
     )?;
@@ -149,11 +273,11 @@ fn run() -> Result<()> {
         &new_tree,
         &report_tree,
         &workspace,
-        &image_functions,
+        image_functions,
         &mut marked_figures,
     )?;
 
-    rewrite_image_references(&report_tree, &marked_figures, &image_functions)?;
+    rewrite_image_references(&report_tree, &marked_figures, image_functions)?;
 
     let mut replaced = 0usize;
     for change in &changes {
@@ -185,16 +309,16 @@ fn run() -> Result<()> {
     // its output so added/modified figure assets still point at the generated framed
     // comparison PDFs. The pass is idempotent because already-rewritten paths no longer
     // match the original asset paths.
-    rewrite_image_references(&report_tree, &marked_figures, &image_functions)?;
+    rewrite_image_references(&report_tree, &marked_figures, image_functions)?;
     rewrite_modified_figures_by_label(
         &report_tree,
         &modified_figure_assets,
     )?;
 
     let removed_references =
-        removed_figure_references(&old_tree, &new_tree, &image_functions)?;
+        removed_figure_references(&old_tree, &new_tree, image_functions)?;
     let removed_definitions =
-        removed_figure_definitions(&old_tree, &new_tree, &image_functions)?;
+        removed_figure_definitions(&old_tree, &new_tree, image_functions)?;
     let removed_label_references =
         removed_figure_label_references(&old_tree, &new_tree)?;
     if !removed_references.is_empty() {
@@ -240,7 +364,6 @@ fn run() -> Result<()> {
         &placed_deleted,
     )?;
 
-    let output = absolute_output(&cli.output)?;
     if let Some(parent) = output.parent() { fs::create_dir_all(parent)?; }
     tools::run(
         "typst",
