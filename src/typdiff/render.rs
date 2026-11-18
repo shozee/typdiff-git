@@ -231,6 +231,8 @@ fn render_spans(
     out: &mut String,
 ) {
     let mut prev_was_diff = false;
+    let mut prev_was_deleted = false;
+    let mut prev_had_citation = false;
     for span in spans {
         if span.text.is_empty() {
             continue;
@@ -245,6 +247,8 @@ fn render_spans(
                 }
                 out.push_str(&span.text);
                 prev_was_diff = false;
+                prev_was_deleted = false;
+                prev_had_citation = false;
             }
             SpanTag::Deleted => {
                 if is_label_only(&span.text) {
@@ -252,6 +256,7 @@ fn render_spans(
                     // last actual output.
                     continue;
                 }
+                let has_cite = span_has_citation(&span.text, citation_keys);
                 write!(
                     out,
                     "#diff-deleted[{}]",
@@ -259,12 +264,24 @@ fn render_spans(
                 )
                 .unwrap();
                 prev_was_diff = true;
+                prev_was_deleted = true;
+                prev_had_citation = has_cite;
             }
             SpanTag::Inserted => {
                 if is_label_only(&span.text) {
                     out.push_str(&span.text);
                     prev_was_diff = false;
+                    prev_was_deleted = false;
+                    prev_had_citation = false;
                     continue;
+                }
+                let has_cite = span_has_citation(&span.text, citation_keys);
+                if prev_was_deleted && (prev_had_citation || has_cite) {
+                    // Prevent Typst from grouping adjacent citations across #diff-deleted and #diff-added.
+                    // Without this separator, Typst's citation engine merges adjacent citations
+                    // into a single citation group anchored at the first citation (#diff-deleted),
+                    // rendering both the old and new citation together in red strikethrough!
+                    out.push('\u{200B}');
                 }
                 write!(
                     out,
@@ -273,9 +290,17 @@ fn render_spans(
                 )
                 .unwrap();
                 prev_was_diff = true;
+                prev_was_deleted = false;
+                prev_had_citation = false;
             }
         }
     }
+}
+
+fn span_has_citation(text: &str, citation_keys: &BTreeSet<String>) -> bool {
+    text.contains('@')
+        || text.contains("#cite")
+        || citation_keys.iter().any(|k| text.contains(k.as_str()))
 }
 
 /// Write the heading prefix (`= `, `== `, etc.).
@@ -621,5 +646,26 @@ mod tests {
         }];
         let output = render(&results);
         assert!(output.contains("#diff-deleted[old]\u{200B}(next)"));
+    }
+
+    #[test]
+    fn test_render_modified_citation_inserts_zws_separator() {
+        let mut citation_keys = BTreeSet::new();
+        citation_keys.insert("smirnov2015".to_string());
+        let results = vec![DiffResult::Modified {
+            kind: BlockKind::Paragraph,
+            spans: vec![
+                DiffSpan {
+                    tag: SpanTag::Deleted,
+                    text: "@smirnov2015".into(),
+                },
+                DiffSpan {
+                    tag: SpanTag::Inserted,
+                    text: "#citet[@smirnov2015]".into(),
+                },
+            ],
+        }];
+        let output = render_with_citations(&results, &citation_keys);
+        assert!(output.contains("#diff-deleted[@smirnov2015]\u{200B}#diff-added[#citet[@smirnov2015]]"));
     }
 }
