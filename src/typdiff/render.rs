@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use super::{Block, BlockKind, DiffResult, DiffSpan, SpanTag, TypstLabel};
@@ -13,7 +14,17 @@ const PREAMBLE: &str = r##"#let diff-added(body) = {
 "##;
 
 /// Render a list of diff results into a compilable Typst source string.
+#[allow(dead_code)]
 pub fn render(results: &[DiffResult]) -> String {
+    render_with_citations(results, &BTreeSet::new())
+}
+
+/// Render a list of diff results into a compilable Typst source string,
+/// preserving known bibliography citation references bare so Typst resolves them.
+pub fn render_with_citations(
+    results: &[DiffResult],
+    citation_keys: &BTreeSet<String>,
+) -> String {
     let mut out = String::new();
     out.push_str(PREAMBLE);
     out.push('\n');
@@ -25,15 +36,15 @@ pub fn render(results: &[DiffResult]) -> String {
                 out.push('\n');
             }
             DiffResult::Added(block) => {
-                render_added_or_deleted(block, DiffTag::Added, &mut out);
+                render_added_or_deleted(block, DiffTag::Added, citation_keys, &mut out);
                 out.push('\n');
             }
             DiffResult::Deleted(block) => {
-                render_added_or_deleted(block, DiffTag::Deleted, &mut out);
+                render_added_or_deleted(block, DiffTag::Deleted, citation_keys, &mut out);
                 out.push('\n');
             }
             DiffResult::Modified { kind, spans } => {
-                render_modified(kind, spans, &mut out);
+                render_modified(kind, spans, citation_keys, &mut out);
                 out.push('\n');
             }
         }
@@ -96,7 +107,12 @@ fn is_label_only(text: &str) -> bool {
 }
 
 /// Render a block wrapped in #diff-added[...] or #diff-deleted[...].
-fn render_added_or_deleted(block: &Block, tag: DiffTag, out: &mut String) {
+fn render_added_or_deleted(
+    block: &Block,
+    tag: DiffTag,
+    citation_keys: &BTreeSet<String>,
+    out: &mut String,
+) {
     let escape_refs = tag == DiffTag::Deleted;
     let func = tag.func_name();
 
@@ -114,21 +130,39 @@ fn render_added_or_deleted(block: &Block, tag: DiffTag, out: &mut String) {
                 out,
                 "#{}[{}]",
                 func,
-                escape_content(source_text, escape_refs)
+                escape_content(source_text, escape_refs, citation_keys)
             )
             .unwrap();
         }
         Block::Heading { depth, body_text } => {
             write_heading_prefix(*depth, out);
-            write!(out, "#{}[{}]", func, escape_content(body_text, escape_refs)).unwrap();
+            write!(
+                out,
+                "#{}[{}]",
+                func,
+                escape_content(body_text, escape_refs, citation_keys)
+            )
+            .unwrap();
         }
         Block::ListItem { body_text } => {
             out.push_str("- ");
-            write!(out, "#{}[{}]", func, escape_content(body_text, escape_refs)).unwrap();
+            write!(
+                out,
+                "#{}[{}]",
+                func,
+                escape_content(body_text, escape_refs, citation_keys)
+            )
+            .unwrap();
         }
         Block::EnumItem { number, body_text } => {
             write_enum_prefix(*number, out);
-            write!(out, "#{}[{}]", func, escape_content(body_text, escape_refs)).unwrap();
+            write!(
+                out,
+                "#{}[{}]",
+                func,
+                escape_content(body_text, escape_refs, citation_keys)
+            )
+            .unwrap();
         }
         Block::TermItem { term, description } => {
             out.push_str("/ ");
@@ -136,14 +170,20 @@ fn render_added_or_deleted(block: &Block, tag: DiffTag, out: &mut String) {
                 out,
                 "#{}[{}: {}]",
                 func,
-                escape_content(term, escape_refs),
-                escape_content(description, escape_refs)
+                escape_content(term, escape_refs, citation_keys),
+                escape_content(description, escape_refs, citation_keys)
             )
             .unwrap();
         }
         // Raw blocks and equations are content-mode; they can be wrapped.
         Block::RawBlock { content } | Block::Equation { content, .. } => {
-            write!(out, "#{}[{}]", func, escape_content(content, escape_refs)).unwrap();
+            write!(
+                out,
+                "#{}[{}]",
+                func,
+                escape_content(content, escape_refs, citation_keys)
+            )
+            .unwrap();
         }
         // FuncCall represents code-mode expressions (#import, #show, etc.).
         // Wrapping them in a content block would change their semantics,
@@ -167,7 +207,12 @@ fn render_added_or_deleted(block: &Block, tag: DiffTag, out: &mut String) {
 }
 
 /// Render a modified block with per-span diff markup.
-fn render_modified(kind: &BlockKind, spans: &[DiffSpan], out: &mut String) {
+fn render_modified(
+    kind: &BlockKind,
+    spans: &[DiffSpan],
+    citation_keys: &BTreeSet<String>,
+    out: &mut String,
+) {
     match kind {
         BlockKind::Heading { depth } => write_heading_prefix(*depth, out),
         BlockKind::ListItem => out.push_str("- "),
@@ -176,11 +221,15 @@ fn render_modified(kind: &BlockKind, spans: &[DiffSpan], out: &mut String) {
         BlockKind::Paragraph => {}
         BlockKind::Atomic | BlockKind::Parbreak => {}
     }
-    render_spans(spans, out);
+    render_spans(spans, citation_keys, out);
 }
 
 /// Render diff spans with markup for deleted/inserted text.
-fn render_spans(spans: &[DiffSpan], out: &mut String) {
+fn render_spans(
+    spans: &[DiffSpan],
+    citation_keys: &BTreeSet<String>,
+    out: &mut String,
+) {
     let mut prev_was_diff = false;
     for span in spans {
         if span.text.is_empty() {
@@ -203,7 +252,12 @@ fn render_spans(spans: &[DiffSpan], out: &mut String) {
                     // last actual output.
                     continue;
                 }
-                write!(out, "#diff-deleted[{}]", escape_content(&span.text, true)).unwrap();
+                write!(
+                    out,
+                    "#diff-deleted[{}]",
+                    escape_content(&span.text, true, citation_keys)
+                )
+                .unwrap();
                 prev_was_diff = true;
             }
             SpanTag::Inserted => {
@@ -212,7 +266,12 @@ fn render_spans(spans: &[DiffSpan], out: &mut String) {
                     prev_was_diff = false;
                     continue;
                 }
-                write!(out, "#diff-added[{}]", escape_content(&span.text, false)).unwrap();
+                write!(
+                    out,
+                    "#diff-added[{}]",
+                    escape_content(&span.text, false, citation_keys)
+                )
+                .unwrap();
                 prev_was_diff = true;
             }
         }
@@ -244,9 +303,15 @@ fn write_enum_prefix(number: Option<usize>, out: &mut String) {
 /// - When `escape_refs` is true, `@` is escaped as `\@` and `<` is escaped
 ///   as `\<` to suppress reference resolution and label creation (used for
 ///   deleted content where the referenced label may no longer exist or would
-///   create duplicates). Label literals inside `#ref(<label>, ...)` are left
-///   unchanged because they are code arguments rather than content labels.
-fn escape_content(s: &str, escape_refs: bool) -> String {
+///   create duplicates). However, if an `@` reference or `<label>` argument
+///   corresponds to a known bibliography citation, it is left bare so Typst
+///   resolves the formatted citation. Label literals inside `#ref(<label>, ...)`
+///   or `#cite(<label>, ...)` are also left unchanged.
+fn escape_content(
+    s: &str,
+    escape_refs: bool,
+    citation_keys: &BTreeSet<String>,
+) -> String {
     let mut result = String::with_capacity(s.len());
     let mut depth: i32 = 0;
     for (i, ch) in s.char_indices() {
@@ -265,12 +330,17 @@ fn escape_content(s: &str, escape_refs: bool) -> String {
                 }
             }
             '@' if escape_refs => {
-                result.push('\\');
-                result.push('@');
+                let rest = &s[i + 1..];
+                if extract_citation_key_at_cursor(rest, citation_keys).is_some() {
+                    result.push('@');
+                } else {
+                    result.push('\\');
+                    result.push('@');
+                }
             }
             // Bare deleted labels are escaped so they do not create anchors.
-            // In `#ref(<label>, ...)`, though, the label is code and must stay bare.
-            '<' if escape_refs && !is_ref_label_arg(s, i) => {
+            // In `#ref(<label>, ...)` or `#cite(...)`, though, the label is code and must stay bare.
+            '<' if escape_refs && !is_ref_or_cite_label_arg(s, i, citation_keys) => {
                 result.push('\\');
                 result.push('<');
             }
@@ -287,66 +357,146 @@ fn escape_content(s: &str, escape_refs: bool) -> String {
     result
 }
 
-/// True when `label_start` points at the `<` in the first argument to `#ref(...)`.
-fn is_ref_label_arg(s: &str, label_start: usize) -> bool {
-    // First require a real Typst label literal. Then look left: the first
-    // argument is preceded by `(`, and the call before that must be `#ref`.
-    TypstLabel::end(&s[label_start..]).is_some()
-        && s[..label_start]
-            .trim_end()
-            .strip_suffix('(')
-            .is_some_and(|prefix| prefix.trim_end().ends_with("#ref"))
+fn is_label_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')
+}
+
+fn extract_citation_key_at_cursor<'a>(
+    rest: &'a str,
+    citation_keys: &BTreeSet<String>,
+) -> Option<&'a str> {
+    if rest.starts_with('<') {
+        let end = rest.find('>')?;
+        let key = &rest[1..end];
+        if citation_keys.contains(key) {
+            return Some(key);
+        }
+        return None;
+    }
+
+    let mut len = 0;
+    for c in rest.chars() {
+        if is_label_char(c) {
+            len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if len == 0 {
+        return None;
+    }
+    let candidate = &rest[..len];
+    if citation_keys.contains(candidate) {
+        return Some(candidate);
+    }
+    let trimmed = candidate.trim_end_matches(['.', ':']);
+    if !trimmed.is_empty() && citation_keys.contains(trimmed) {
+        return Some(trimmed);
+    }
+    None
+}
+
+/// True when `label_start` points at the `<` in the first argument to `#ref(...)` or `#cite(...)`,
+/// or when the label ID is a known citation key.
+fn is_ref_or_cite_label_arg(
+    s: &str,
+    label_start: usize,
+    citation_keys: &BTreeSet<String>,
+) -> bool {
+    let Some(label_len) = TypstLabel::end(&s[label_start..]) else {
+        return false;
+    };
+    let label_id = &s[label_start + 1..label_start + label_len - 1];
+    if citation_keys.contains(label_id) {
+        return true;
+    }
+
+    s[..label_start]
+        .trim_end()
+        .strip_suffix('(')
+        .is_some_and(|prefix| {
+            let p = prefix.trim_end();
+            p.ends_with("#ref") || p.ends_with("#cite")
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn escape(s: &str, escape_refs: bool) -> String {
+        escape_content(s, escape_refs, &BTreeSet::new())
+    }
+
     #[test]
     fn test_escape_content_no_special() {
-        assert_eq!(escape_content("hello world", false), "hello world");
+        assert_eq!(escape("hello world", false), "hello world");
     }
 
     #[test]
     fn test_escape_content_balanced_brackets() {
-        assert_eq!(escape_content("a [b] c", false), "a [b] c");
+        assert_eq!(escape("a [b] c", false), "a [b] c");
     }
 
     #[test]
     fn test_escape_content_unbalanced_bracket() {
-        assert_eq!(escape_content("a ] b", false), "a \\] b");
+        assert_eq!(escape("a ] b", false), "a \\] b");
     }
 
     #[test]
     fn test_escape_content_trailing_backslash() {
-        assert_eq!(escape_content("text\\", false), "text\\ ");
+        assert_eq!(escape("text\\", false), "text\\ ");
     }
 
     #[test]
     fn test_escape_content_trailing_double_backslash() {
-        assert_eq!(escape_content("text\\\\", false), "text\\\\");
+        assert_eq!(escape("text\\\\", false), "text\\\\");
     }
 
     #[test]
     fn test_escape_content_refs_not_escaped_by_default() {
-        assert_eq!(escape_content("see @ref here", false), "see @ref here");
+        assert_eq!(escape("see @ref here", false), "see @ref here");
     }
 
     #[test]
     fn test_escape_content_refs_escaped_when_requested() {
-        assert_eq!(escape_content("see @ref here", true), "see \\@ref here");
+        assert_eq!(escape("see @ref here", true), "see \\@ref here");
     }
 
     #[test]
     fn test_escape_content_labels_escaped_when_requested() {
-        assert_eq!(escape_content("text <my-label>", true), "text \\<my-label>");
+        assert_eq!(escape("text <my-label>", true), "text \\<my-label>");
     }
 
     #[test]
     fn test_escape_content_ref_call_label_not_escaped_when_requested() {
         assert_eq!(
-            escape_content("compare #ref(<tbl-cobalt-notes>, supplement: [])", true),
+            escape("compare #ref(<tbl-cobalt-notes>, supplement: [])", true),
             "compare #ref(<tbl-cobalt-notes>, supplement: [])"
+        );
+    }
+
+    #[test]
+    fn test_escape_content_citation_not_escaped() {
+        let mut citations = BTreeSet::new();
+        citations.insert("Smirnov2015".to_string());
+        citations.insert("smirnovInvestigatingLocalAtmospheric2015".to_string());
+
+        assert_eq!(
+            escape_content("see @Smirnov2015 here", true, &citations),
+            "see @Smirnov2015 here"
+        );
+        assert_eq!(
+            escape_content("see @Smirnov2015. here", true, &citations),
+            "see @Smirnov2015. here"
+        );
+        assert_eq!(
+            escape_content("#citet[@smirnovInvestigatingLocalAtmospheric2015]", true, &citations),
+            "#citet[@smirnovInvestigatingLocalAtmospheric2015]"
+        );
+        assert_eq!(
+            escape_content("#cite(<Smirnov2015>)", true, &citations),
+            "#cite(<Smirnov2015>)"
         );
     }
 

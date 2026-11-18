@@ -203,6 +203,15 @@ fn generate_diff(
     repo.export_revision(&cli.new, &new_tree)?;
     copy_tree(&new_tree, &report_tree)?;
 
+    // Ensure any deleted bibliography entries from old revision are present in report_tree
+    sync_old_bib_entries_to_report(&old_tree, &report_tree)?;
+
+    // Collect all citation keys from old, new, and report trees
+    let citation_keys = collect_citation_keys_from_trees(&[&old_tree, &new_tree, &report_tree]);
+    if !citation_keys.is_empty() {
+        eprintln!("indexed {} bibliography citation key(s)", citation_keys.len());
+    }
+
     // Mark newly-added figure definitions by label, independently of whether the
     // underlying image asset is tracked, generated, reused, or referenced through a
     // custom wrapper. This is more reliable than asset-only detection for Added figures.
@@ -294,13 +303,13 @@ fn generate_diff(
                 let empty = workspace.join(format!("empty-{replaced}.typ"));
                 fs::write(&empty, "")?;
                 let rewritten_new = report_tree.join(&change.new_path);
-                run_typdiff(&empty, &rewritten_new, &rewritten_new)?;
+                run_typdiff(&empty, &rewritten_new, &rewritten_new, &citation_keys)?;
                 replaced += 1;
             }
             ChangeKind::Modified | ChangeKind::Renamed => {
                 let old_source = old_tree.join(&change.old_path);
                 let rewritten_new = report_tree.join(&change.new_path);
-                run_typdiff(&old_source, &rewritten_new, &rewritten_new)?;
+                run_typdiff(&old_source, &rewritten_new, &rewritten_new, &citation_keys)?;
                 replaced += 1;
             }
         }
@@ -1920,7 +1929,12 @@ fn relative_path(from_dir: &Path, target: &Path) -> Option<String> {
 fn normalize_path(path: &Path) -> String { path.to_string_lossy().replace('\\', "/") }
 fn typst_string(path: &Path) -> String { normalize_path(path).replace('"', "\\\"") }
 
-fn run_typdiff(old: &Path, new: &Path, target: &Path) -> Result<()> {
+fn run_typdiff(
+    old: &Path,
+    new: &Path,
+    target: &Path,
+    citation_keys: &BTreeSet<String>,
+) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1932,7 +1946,7 @@ fn run_typdiff(old: &Path, new: &Path, target: &Path) -> Result<()> {
     let new_source = fs::read_to_string(new)
         .with_context(|| format!("reading {}", new.display()))?;
     let (old_source, new_source) =
-        neutralize_one_sided_references(&old_source, &new_source);
+        neutralize_one_sided_references(&old_source, &new_source, citation_keys);
 
     let old_blocks: Vec<_> = typdiff::parse::parse(&old_source)
         .into_iter()
@@ -1944,7 +1958,7 @@ fn run_typdiff(old: &Path, new: &Path, target: &Path) -> Result<()> {
         .collect();
 
     let diff_results = typdiff::diff::diff(&old_blocks, &new_blocks);
-    let diff_output = typdiff::render::render(&diff_results);
+    let diff_output = typdiff::render::render_with_citations(&diff_results, citation_keys);
 
     let sanitized_output = repair_typdiff_brackets(&diff_output);
     let sanitized_output = repair_typdiff_labels(&sanitized_output);
@@ -1953,9 +1967,13 @@ fn run_typdiff(old: &Path, new: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("writing visual diff to {}", target.display()))?;
     Ok(())
 }
-fn neutralize_one_sided_references(old: &str, new: &str) -> (String, String) {
-    let old_tokens = collect_reference_tokens(old);
-    let new_tokens = collect_reference_tokens(new);
+fn neutralize_one_sided_references(
+    old: &str,
+    new: &str,
+    citation_keys: &BTreeSet<String>,
+) -> (String, String) {
+    let old_tokens = collect_reference_tokens(old, citation_keys);
+    let new_tokens = collect_reference_tokens(new, citation_keys);
     let old_only: BTreeSet<String> = old_tokens.difference(&new_tokens).cloned().collect();
 
     // Only references that disappear from the document must be rendered literally.
@@ -1965,7 +1983,10 @@ fn neutralize_one_sided_references(old: &str, new: &str) -> (String, String) {
     (replace_tokens_with_raw(old, &old_only), new.to_string())
 }
 
-fn collect_reference_tokens(source: &str) -> BTreeSet<String> {
+fn collect_reference_tokens(
+    source: &str,
+    citation_keys: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let chars: Vec<char> = source.chars().collect();
     let mut tokens = BTreeSet::new();
     let mut index = 0usize;
@@ -1973,12 +1994,24 @@ fn collect_reference_tokens(source: &str) -> BTreeSet<String> {
         if chars[index] == '@' {
             let start = index;
             index += 1;
-            if chars.get(index) == Some(&'<') {
+            let key = if chars.get(index) == Some(&'<') {
                 index += 1;
+                let k_start = index;
                 while index < chars.len() && chars[index] != '>' { index += 1; }
+                let k = chars[k_start..index].iter().collect::<String>();
                 if index < chars.len() { index += 1; }
+                k
             } else {
+                let k_start = index;
                 while index < chars.len() && is_label_char(chars[index]) { index += 1; }
+                while index > k_start && (chars[index - 1] == '.' || chars[index - 1] == ':') {
+                    index -= 1;
+                }
+                chars[k_start..index].iter().collect::<String>()
+            };
+            if citation_keys.contains(&key) {
+                // Known bibliography citations must remain executable Typst.
+                continue;
             }
             if index > start + 1 {
                 tokens.insert(chars[start..index].iter().collect());
@@ -2006,6 +2039,198 @@ fn collect_reference_tokens(source: &str) -> BTreeSet<String> {
         index += 1;
     }
     tokens
+}
+
+fn collect_citation_keys_from_trees(trees: &[&Path]) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for tree in trees {
+        if !tree.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(tree).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("bib") {
+                if let Ok(content) = fs::read_to_string(path) {
+                    keys.extend(extract_bib_keys(&content));
+                }
+            } else if ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml") {
+                if let Ok(content) = fs::read_to_string(path) {
+                    keys.extend(extract_yaml_citation_keys(&content));
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn extract_bib_keys(content: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            i += 1;
+            let type_start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+            {
+                i += 1;
+            }
+            let entry_type = &content[type_start..i].to_ascii_lowercase();
+            if entry_type == "comment"
+                || entry_type == "preamble"
+                || entry_type == "string"
+                || entry_type.is_empty()
+            {
+                continue;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'{' || bytes[i] == b'(') {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let key_start = i;
+                while i < bytes.len()
+                    && bytes[i] != b','
+                    && bytes[i] != b'}'
+                    && bytes[i] != b')'
+                    && !bytes[i].is_ascii_whitespace()
+                {
+                    i += 1;
+                }
+                if i > key_start {
+                    let key = content[key_start..i].trim();
+                    if !key.is_empty() {
+                        keys.insert(key.to_string());
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    keys
+}
+
+fn extract_yaml_citation_keys(content: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for line in content.lines() {
+        if line.starts_with(' ')
+            || line.starts_with('\t')
+            || line.starts_with('#')
+            || line.trim().is_empty()
+        {
+            continue;
+        }
+        if let Some(colon) = line.find(':') {
+            let key = line[..colon].trim();
+            if !key.is_empty() && !key.contains(' ') {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+fn sync_old_bib_entries_to_report(old_tree: &Path, report_tree: &Path) -> Result<()> {
+    if !old_tree.exists() || !report_tree.exists() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(old_tree).into_iter().filter_map(|e| e.ok()) {
+        let old_path = entry.path();
+        if !old_path.is_file() {
+            continue;
+        }
+        let ext = old_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !ext.eq_ignore_ascii_case("bib") {
+            continue;
+        }
+        let rel = old_path.strip_prefix(old_tree)?;
+        let report_path = report_tree.join(rel);
+        if !report_path.exists() {
+            if let Some(parent) = report_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(old_path, &report_path)?;
+            continue;
+        }
+        let old_content = fs::read_to_string(old_path)?;
+        let report_content = fs::read_to_string(&report_path)?;
+        let report_keys = extract_bib_keys(&report_content);
+
+        let mut to_append = String::new();
+        let bytes = old_content.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'@' {
+                let entry_start = i;
+                i += 1;
+                let type_start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                let entry_type = &old_content[type_start..i].to_ascii_lowercase();
+                if entry_type == "comment"
+                    || entry_type == "preamble"
+                    || entry_type == "string"
+                    || entry_type.is_empty()
+                {
+                    continue;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && (bytes[i] == b'{' || bytes[i] == b'(') {
+                    let open_char = bytes[i];
+                    let close_char = if open_char == b'{' { b'}' } else { b')' };
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    let key_start = i;
+                    while i < bytes.len()
+                        && bytes[i] != b','
+                        && bytes[i] != close_char
+                        && !bytes[i].is_ascii_whitespace()
+                    {
+                        i += 1;
+                    }
+                    let key = old_content[key_start..i].trim();
+                    let mut depth = 1usize;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == open_char {
+                            depth += 1;
+                        } else if bytes[i] == close_char {
+                            depth -= 1;
+                        }
+                        i += 1;
+                    }
+                    if !key.is_empty() && !report_keys.contains(key) {
+                        to_append.push('\n');
+                        to_append.push_str(&old_content[entry_start..i]);
+                        to_append.push('\n');
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if !to_append.is_empty() {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&report_path)?;
+            f.write_all(to_append.as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 fn find_char_call_end(chars: &[char], open: usize) -> Option<usize> {
@@ -2326,5 +2551,40 @@ mod tests {
         let source = "#diff-added[hello]\n\n<fig:detached>";
         let fixed = repair_typdiff_labels(source);
         assert_eq!(fixed, source);
+    }
+
+    #[test]
+    fn test_extract_bib_keys() {
+        let bib = r#"
+@article{smirnov2015,
+  title = {A test},
+  author = {Smirnov, A.},
+  year = 2015
+}
+@misc{Derber:1989,
+  title = {Another test}
+}
+@comment{ignore_me, text = {comment}}
+"#;
+        let keys = extract_bib_keys(bib);
+        assert!(keys.contains("smirnov2015"));
+        assert!(keys.contains("Derber:1989"));
+        assert!(!keys.contains("ignore_me"));
+    }
+
+    #[test]
+    fn test_neutralize_one_sided_references_preserves_citations() {
+        let mut citation_keys = BTreeSet::new();
+        citation_keys.insert("smirnov2015".to_string());
+
+        let old = "as shown by @smirnov2015 and @old_figure.";
+        let new = "as shown by @new_figure.";
+
+        let (neutralized_old, _) = neutralize_one_sided_references(old, new, &citation_keys);
+        // @smirnov2015 should NOT be wrapped in backticks because it is in citation_keys
+        assert!(neutralized_old.contains("@smirnov2015"));
+        assert!(!neutralized_old.contains("`@smirnov2015`"));
+        // @old_figure should be wrapped in backticks because it disappeared and is not a citation
+        assert!(neutralized_old.contains("`@old_figure`"));
     }
 }
