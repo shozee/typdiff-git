@@ -209,6 +209,10 @@ fn tokenize_mixed(s: &str) -> Vec<&str> {
                     break;
                 }
             }
+            // Strip trailing punctuation that cannot be part of a reference identifier
+            while i > start + 1 && (s.as_bytes()[i - 1] == b'.' || s.as_bytes()[i - 1] == b':') {
+                i -= 1;
+            }
             tokens.push(&s[start..i]);
         } else if c == '<' {
             let start = i;
