@@ -290,10 +290,6 @@ fn generate_diff(
 
     let mut replaced = 0usize;
     for change in &changes {
-        if change.old_path == cli.main || change.new_path == cli.main {
-            eprintln!("warning: using newer {} as the document entry point; its own edits are not highlighted", cli.main.display());
-            continue;
-        }
         match change.kind {
             ChangeKind::Deleted => eprintln!(
                 "note: deleted file omitted from newer full-document report: {}",
