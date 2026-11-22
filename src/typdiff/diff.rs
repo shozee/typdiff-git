@@ -1,4 +1,5 @@
 use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
+use typst_syntax::SyntaxKind;
 
 use super::{Block, DiffResult, DiffSpan, SpanTag, TypstLabel};
 
@@ -154,20 +155,41 @@ fn process_replace(old_range: &[Block], new_range: &[Block], results: &mut Vec<D
 /// individual single-character token.
 ///
 /// Typst code expressions (`#func[...]`, `#func(...)`), references (`@label`),
-/// and labels (`<label>`) are treated as atomic tokens so the diff never
-/// fragments valid Typst syntax.
+/// labels (`<label>`), and inline equations (`$...$`) are treated as atomic
+/// tokens so the diff never fragments valid Typst syntax.
 ///
 /// This gives word-level granularity for Latin text while allowing
 /// character-level precision for CJK text (which has no whitespace boundaries).
 fn tokenize_mixed(s: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut i = 0;
+    let mut atomic_ranges = typst_atomic_ranges(s).into_iter().peekable();
 
     while i < s.len() {
         let c = s[i..].chars().next().unwrap();
         let c_len = c.len_utf8();
 
-        if c == '#' {
+        if let Some(&(start, end)) = atomic_ranges.peek() {
+            if i == start {
+                atomic_ranges.next();
+                tokens.push(&s[start..end]);
+                i = end;
+                continue;
+            }
+        }
+
+        if c == '\\' {
+            // Escaped punctuation (e.g. \$, \[, \#, \\)
+            let start = i;
+            i += c_len;
+            if i < s.len() {
+                let next = s[i..].chars().next().unwrap();
+                if !next.is_alphanumeric() {
+                    i += next.len_utf8();
+                }
+            }
+            tokens.push(&s[start..i]);
+        } else if c == '#' {
             // Typst code expression: #identifier followed by [...] and/or (...)
             let start = i;
             i += 1; // skip '#'
@@ -274,6 +296,44 @@ fn skip_balanced(s: &str, start: usize, open: char, close: char) -> usize {
     i
 }
 
+/// Find composite Typst markup expressions using Typst's parser.
+///
+/// Diffing must not split the source text of a Typst expression, since a
+/// partial expression is not necessarily valid markup. Plain text and
+/// whitespace retain word/character granularity for useful highlighting.
+fn typst_atomic_ranges(s: &str) -> Vec<(usize, usize)> {
+    let root = typst_syntax::parse(s);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let nodes: Vec<_> = root.children().cloned().collect();
+    let mut index = 0;
+    while index < nodes.len() {
+        let node = &nodes[index];
+        if node.kind() == SyntaxKind::Hash
+            && index + 1 < nodes.len()
+            && !matches!(
+                nodes[index + 1].kind(),
+                SyntaxKind::Text | SyntaxKind::Space | SyntaxKind::Linebreak | SyntaxKind::Parbreak
+            )
+        {
+            let end = start + node.len() + nodes[index + 1].len();
+            ranges.push((start, end));
+            start += node.len() + nodes[index + 1].len();
+            index += 2;
+            continue;
+        }
+        if !matches!(
+            node.kind(),
+            SyntaxKind::Text | SyntaxKind::Space | SyntaxKind::Linebreak | SyntaxKind::Parbreak
+        ) {
+            ranges.push((start, start + node.len()));
+        }
+        start += node.len();
+        index += 1;
+    }
+    ranges
+}
+
 /// Perform mixed-granularity diff and return coalesced spans.
 ///
 /// Uses a custom tokenizer that splits CJK characters individually while
@@ -363,16 +423,12 @@ mod tests {
         assert_eq!(results.len(), 1);
         if let DiffResult::Modified { kind, spans } = &results[0] {
             assert_eq!(*kind, BlockKind::Paragraph);
-            assert!(
-                spans
-                    .iter()
-                    .any(|s| s.tag == SpanTag::Deleted && s.text.contains("old"))
-            );
-            assert!(
-                spans
-                    .iter()
-                    .any(|s| s.tag == SpanTag::Inserted && s.text.contains("new"))
-            );
+            assert!(spans
+                .iter()
+                .any(|s| s.tag == SpanTag::Deleted && s.text.contains("old")));
+            assert!(spans
+                .iter()
+                .any(|s| s.tag == SpanTag::Inserted && s.text.contains("new")));
         } else {
             panic!("expected Modified, got {:?}", results[0]);
         }
@@ -565,6 +621,33 @@ mod tests {
     }
 
     #[test]
+    fn test_tokenize_typst_markup_expressions_atomic() {
+        for (source, expression) in [
+            ("Use *strong text* here", "*strong text*"),
+            ("Use _emphasized text_ here", "_emphasized text_"),
+            ("See @sample-ref for details", "@sample-ref"),
+            ("Use `raw text` here", "`raw text`"),
+            ("Call #text(fill: red)[styled]", "#text(fill: red)[styled]"),
+            ("Use $x + y$ in text", "$x + y$"),
+        ] {
+            let tokens = tokenize_mixed(source);
+            assert!(
+                tokens.contains(&expression),
+                "composite expression should remain atomic, got: {source:?} -> {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tokenize_typst_escaped_dollar_as_escape() {
+        let tokens = tokenize_mixed(r"costs \$10 and \$20");
+        assert!(
+            tokens.contains(&r"\$"),
+            "expected escaped dollar token, got: {tokens:?}"
+        );
+    }
+
+    #[test]
     fn test_tokenize_cjk_char_level() {
         // CJK characters should be tokenized individually (no whitespace boundaries).
         let tokens = tokenize_mixed("吾輩は猫である");
@@ -659,18 +742,31 @@ mod tests {
     #[test]
     fn test_process_replace_interleaves_deleted_blocks() {
         let old_blocks = vec![
-            Block::Paragraph { source_text: "First paragraph with shared words.".into() },
-            Block::Paragraph { source_text: "Second paragraph that gets modified slightly.".into() },
-            Block::Paragraph { source_text: "Third paragraph that was deleted.".into() },
+            Block::Paragraph {
+                source_text: "First paragraph with shared words.".into(),
+            },
+            Block::Paragraph {
+                source_text: "Second paragraph that gets modified slightly.".into(),
+            },
+            Block::Paragraph {
+                source_text: "Third paragraph that was deleted.".into(),
+            },
         ];
         let new_blocks = vec![
-            Block::Paragraph { source_text: "First paragraph with shared words.".into() },
-            Block::Paragraph { source_text: "Second paragraph that gets modified greatly.".into() },
+            Block::Paragraph {
+                source_text: "First paragraph with shared words.".into(),
+            },
+            Block::Paragraph {
+                source_text: "Second paragraph that gets modified greatly.".into(),
+            },
         ];
         let results = diff(&old_blocks, &new_blocks);
         // Expect: Unchanged or Modified(First), Modified(Second), Deleted(Third)
         assert_eq!(results.len(), 3);
-        assert!(matches!(results[0], DiffResult::Unchanged(_) | DiffResult::Modified { .. }));
+        assert!(matches!(
+            results[0],
+            DiffResult::Unchanged(_) | DiffResult::Modified { .. }
+        ));
         assert!(matches!(results[1], DiffResult::Modified { .. }));
         assert!(matches!(results[2], DiffResult::Deleted(_)));
     }

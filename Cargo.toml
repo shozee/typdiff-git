@@ -1,6 +1,6 @@
 [package]
 name = "typdiff-git"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "Generate one visual Typst revision PDF from all .typ files changed between two Git revisions"
 license = "Apache-2.0"
