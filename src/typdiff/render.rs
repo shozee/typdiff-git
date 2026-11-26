@@ -29,14 +29,46 @@ pub fn render_with_citations(
     out.push_str(PREAMBLE);
     out.push('\n');
 
+    // Byte index of the closing `]` of the most recent `#diff-added[...]`
+    // wrapping an equation or raw block, preserved across interleaved
+    // `#diff-deleted[...]` blocks so a following label attaches to the
+    // inner element rather than the `#diff-added`/`#diff-deleted` wrapper.
+    let mut last_added_wrapped_close: Option<usize> = None;
+
     for result in results {
         match result {
             DiffResult::Unchanged(block) => {
+                if let Block::Paragraph { source_text } = block {
+                    if is_label_only(source_text) {
+                        if let Some(close_idx) = last_added_wrapped_close {
+                            let label_insert = format!(" {}", source_text.trim());
+                            out.insert_str(close_idx, &label_insert);
+                            last_added_wrapped_close = Some(close_idx + label_insert.len());
+                            continue;
+                        }
+                    }
+                }
+                last_added_wrapped_close = None;
                 render_block(block, &mut out);
                 out.push('\n');
             }
             DiffResult::Added(block) => {
+                if let Block::Paragraph { source_text } = block {
+                    if is_label_only(source_text) {
+                        if let Some(close_idx) = last_added_wrapped_close {
+                            let label_insert = format!(" {}", source_text.trim());
+                            out.insert_str(close_idx, &label_insert);
+                            last_added_wrapped_close = Some(close_idx + label_insert.len());
+                            continue;
+                        }
+                    }
+                }
                 render_added_or_deleted(block, DiffTag::Added, citation_keys, &mut out);
+                if matches!(block, Block::Equation { .. } | Block::RawBlock { .. }) {
+                    last_added_wrapped_close = out.len().checked_sub(1);
+                } else {
+                    last_added_wrapped_close = None;
+                }
                 out.push('\n');
             }
             DiffResult::Deleted(block) => {
@@ -44,6 +76,7 @@ pub fn render_with_citations(
                 out.push('\n');
             }
             DiffResult::Modified { kind, spans } => {
+                last_added_wrapped_close = None;
                 render_modified(kind, spans, citation_keys, &mut out);
                 out.push('\n');
             }
@@ -667,5 +700,26 @@ mod tests {
         }];
         let output = render_with_citations(&results, &citation_keys);
         assert!(output.contains("#diff-deleted[@smirnov2015]\u{200B}#diff-added[#citet[@smirnov2015]]"));
+    }
+
+    #[test]
+    fn test_render_equation_label_attaches_inside_added_block() {
+        let results = vec![
+            DiffResult::Added(Block::Equation {
+                content: "$ a = b, $".into(),
+                block: true,
+            }),
+            DiffResult::Deleted(Block::Equation {
+                content: "$ a = b. $".into(),
+                block: true,
+            }),
+            DiffResult::Unchanged(Block::Paragraph {
+                source_text: "<eq:test>".into(),
+            }),
+        ];
+        let output = render(&results);
+        assert!(output.contains("#diff-added[$ a = b, $ <eq:test>]"));
+        assert!(output.contains("#diff-deleted[$ a = b. $]"));
+        assert!(!output.contains("#diff-deleted[$ a = b. $]\n\n<eq:test>"));
     }
 }
