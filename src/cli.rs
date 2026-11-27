@@ -36,6 +36,12 @@ pub struct Cli {
     /// Typst file included at the end of main.typ for generated revision notices
     #[arg(long = "notices-file", default_value = ".typdiff-notices.typ")]
     pub notices_file: PathBuf,
+    /// Prepend a summary cover page listing changes with clickable page hyperlinks
+    #[arg(long = "summary-page")]
+    pub summary_page: bool,
+    /// Typst file included at the top of main.typ for the generated summary page
+    #[arg(long = "summary-file", default_value = ".typdiff-summary.typ")]
+    pub summary_file: PathBuf,
 }
 
 impl Cli {

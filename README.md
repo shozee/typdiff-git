@@ -154,6 +154,19 @@ typdiff-git ver2.1 WORKTREE -w
 
 Watch mode continuously monitors tracked and untracked files in the repository (excluding `.git` and the output PDF), debounces rapid edits, and re-compiles the diff upon file changes without having to re-run the command manually. If a compilation error occurs, watch mode reports the error and continues watching for fixes.
 
+## Summary cover page
+
+Pass `--summary-page` to prepend a revision summary cover page listing all detected text, equation, table, and figure changes with excerpts, logical page numbers, and clickable PDF hyperlinks that jump directly to each change:
+
+```bash
+typdiff-git submitted-version WORKTREE \
+  --main main.typ \
+  --summary-page \
+  -o revision-diff.pdf
+```
+
+By default, the generated cover page source is written to `.typdiff-summary.typ` inside the report tree (override with `--summary-file`). Logical page numbering resets cleanly after the summary page so the main document preserves its original page numbers.
+
 ## Multi-file Typst projects
 
 A typical project may look like this:

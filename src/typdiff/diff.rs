@@ -59,7 +59,7 @@ pub fn diff(old_blocks: &[Block], new_blocks: &[Block]) -> Vec<DiffResult> {
 }
 
 /// Compute character-level similarity ratio between two strings (0.0–1.0).
-fn text_similarity(a: &str, b: &str) -> f32 {
+pub(crate) fn text_similarity(a: &str, b: &str) -> f32 {
     TextDiff::from_chars(a, b).ratio()
 }
 
@@ -160,7 +160,7 @@ fn process_replace(old_range: &[Block], new_range: &[Block], results: &mut Vec<D
 ///
 /// This gives word-level granularity for Latin text while allowing
 /// character-level precision for CJK text (which has no whitespace boundaries).
-fn tokenize_mixed(s: &str) -> Vec<&str> {
+pub(crate) fn tokenize_mixed(s: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut i = 0;
     let mut atomic_ranges = typst_atomic_ranges(s).into_iter().peekable();
@@ -338,11 +338,15 @@ fn typst_atomic_ranges(s: &str) -> Vec<(usize, usize)> {
 ///
 /// Uses a custom tokenizer that splits CJK characters individually while
 /// keeping ASCII words intact, then diffs at the token level.
-fn word_diff(old_text: &str, new_text: &str) -> Vec<DiffSpan> {
+pub(crate) fn word_diff(old_text: &str, new_text: &str) -> Vec<DiffSpan> {
     let old_tokens = tokenize_mixed(old_text);
     let new_tokens = tokenize_mixed(new_text);
+    diff_token_slices(&old_tokens, &new_tokens)
+}
 
-    let diff = TextDiff::configure().diff_slices(&old_tokens, &new_tokens);
+/// Diff two pre-tokenized slice sequences and return coalesced, reordered spans.
+pub(crate) fn diff_token_slices(old_tokens: &[&str], new_tokens: &[&str]) -> Vec<DiffSpan> {
+    let diff = TextDiff::configure().diff_slices(old_tokens, new_tokens);
 
     let raw_spans: Vec<DiffSpan> = diff
         .iter_all_changes()

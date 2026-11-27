@@ -33,6 +33,18 @@ struct PlacedDeletedFigure {
     label: String,
 }
 
+#[derive(Clone, Debug)]
+struct SummaryEntry {
+    anchor: String,
+    file: PathBuf,
+    kind: String,
+    block_label: String,
+    figure_label: Option<String>,
+    context_excerpt: Option<String>,
+    old_excerpt: Option<String>,
+    new_excerpt: Option<String>,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
@@ -289,23 +301,64 @@ fn generate_diff(
     rewrite_image_references(&report_tree, &marked_figures, image_functions)?;
 
     let mut replaced = 0usize;
+    let mut summary_entries: Vec<SummaryEntry> = Vec::new();
+    let mut typdiff_processed_files: BTreeSet<PathBuf> = BTreeSet::new();
     for change in &changes {
         match change.kind {
-            ChangeKind::Deleted => eprintln!(
-                "note: deleted file omitted from newer full-document report: {}",
-                change.old_path.display()
-            ),
+            ChangeKind::Deleted => {
+                eprintln!(
+                    "note: deleted file omitted from newer full-document report: {}",
+                    change.old_path.display()
+                );
+                if cli.summary_page {
+                    summary_entries.push(SummaryEntry {
+                        anchor: String::new(),
+                        file: change.old_path.clone(),
+                        kind: "Deleted".to_string(),
+                        block_label: "File".to_string(),
+                        figure_label: None,
+                        context_excerpt: None,
+                        old_excerpt: Some(format!(
+                            "Removed file {}",
+                            normalize_path(&change.old_path)
+                        )),
+                        new_excerpt: None,
+                    });
+                }
+            }
             ChangeKind::Added => {
                 let empty = workspace.join(format!("empty-{replaced}.typ"));
                 fs::write(&empty, "")?;
                 let rewritten_new = report_tree.join(&change.new_path);
-                run_typdiff(&empty, &rewritten_new, &rewritten_new, &citation_keys)?;
+                let prefix = cli
+                    .summary_page
+                    .then(|| format!("typdiff:s{replaced}:"));
+                let anchors = run_typdiff(
+                    &empty,
+                    &rewritten_new,
+                    &rewritten_new,
+                    &citation_keys,
+                    prefix.as_deref(),
+                )?;
+                typdiff_processed_files.insert(change.new_path.clone());
+                append_summary_anchors(&mut summary_entries, &change.new_path, anchors);
                 replaced += 1;
             }
             ChangeKind::Modified | ChangeKind::Renamed => {
                 let old_source = old_tree.join(&change.old_path);
                 let rewritten_new = report_tree.join(&change.new_path);
-                run_typdiff(&old_source, &rewritten_new, &rewritten_new, &citation_keys)?;
+                let prefix = cli
+                    .summary_page
+                    .then(|| format!("typdiff:s{replaced}:"));
+                let anchors = run_typdiff(
+                    &old_source,
+                    &rewritten_new,
+                    &rewritten_new,
+                    &citation_keys,
+                    prefix.as_deref(),
+                )?;
+                typdiff_processed_files.insert(change.new_path.clone());
+                append_summary_anchors(&mut summary_entries, &change.new_path, anchors);
                 replaced += 1;
             }
         }
@@ -319,6 +372,17 @@ fn generate_diff(
         &report_tree,
         &modified_figure_assets,
     )?;
+
+    if cli.summary_page {
+        collect_summary_figure_entries(
+            &report_tree,
+            &added_figure_labels,
+            &typdiff_processed_files,
+            &cli.notices_file,
+            &cli.summary_file,
+            &mut summary_entries,
+        )?;
+    }
 
     let removed_references =
         removed_figure_references(&old_tree, &new_tree, image_functions)?;
@@ -344,10 +408,14 @@ fn generate_diff(
             eprintln!("  - <{}>", label);
         }
     }
+    let mut delfig_counter = 0usize;
     let placed_deleted = place_deleted_figure_notices(
         &report_tree,
         &removed_definitions,
         &removed_label_references,
+        cli.summary_page,
+        &mut delfig_counter,
+        cli.summary_page.then_some(&mut summary_entries),
     )?;
     if !placed_deleted.is_empty() {
         eprintln!("placed {} deleted-figure notice(s) near their former references", placed_deleted.len());
@@ -367,7 +435,20 @@ fn generate_diff(
         &removed_definitions,
         &removed_label_references,
         &placed_deleted,
+        &mut delfig_counter,
+        cli.summary_page.then_some(&mut summary_entries),
     )?;
+
+    if cli.summary_page {
+        write_summary_page(
+            &main_file,
+            &report_tree,
+            &cli.summary_file,
+            &cli.old,
+            &cli.new,
+            &summary_entries,
+        )?;
+    }
 
     if let Some(parent) = output.parent() { fs::create_dir_all(parent)?; }
     tools::run(
@@ -388,6 +469,12 @@ fn generate_diff(
             "debug notice source: {}",
             report_tree.join(&cli.notices_file).display()
         );
+        if cli.summary_page {
+            println!(
+                "debug summary source: {}",
+                report_tree.join(&cli.summary_file).display()
+            );
+        }
     }
     println!(
         "created {} from {} ({} child files, {} figures highlighted, and {} deleted-figure notices)",
@@ -553,11 +640,22 @@ fn mark_added_figure_definitions(
 }
 
 fn find_figure_definition_ranges(source: &str) -> Vec<(usize, usize, String)> {
+    find_figure_definition_ranges_inner(source, false)
+}
+
+fn find_figure_definition_ranges_inner(
+    source: &str,
+    all_labels: bool,
+) -> Vec<(usize, usize, String)> {
     let mut result = Vec::new();
     let mut offset = 0usize;
 
     while let Some(relative) = source[offset..].find("#figure") {
         let start = offset + relative;
+        if is_inside_line_comment(source, start) {
+            offset = start + "#figure".len();
+            continue;
+        }
         let mut open = start + "#figure".len();
         while open < source.len() && source.as_bytes()[open].is_ascii_whitespace() {
             open += 1;
@@ -571,12 +669,7 @@ fn find_figure_definition_ranges(source: &str) -> Vec<(usize, usize, String)> {
             continue;
         };
 
-        let mut label_open = close + 1;
-        while label_open < source.len()
-            && source.as_bytes()[label_open].is_ascii_whitespace()
-        {
-            label_open += 1;
-        }
+        let label_open = skip_whitespace_and_comments(source, close + 1);
         if source.as_bytes().get(label_open) != Some(&b'<') {
             offset = close + 1;
             continue;
@@ -587,13 +680,44 @@ fn find_figure_definition_ranges(source: &str) -> Vec<(usize, usize, String)> {
         };
         let label_close = label_open + 1 + label_end_relative;
         let label = source[label_open + 1..label_close].trim().to_string();
-        if label.starts_with("fig:") {
+        if (all_labels && typst_syntax::is_valid_label_literal_id(&label))
+            || label.starts_with("fig:")
+        {
             result.push((start, label_close + 1, label));
         }
         offset = label_close + 1;
     }
 
     result
+}
+
+fn is_inside_line_comment(source: &str, pos: usize) -> bool {
+    let line_start = source[..pos].rfind('\n').map_or(0, |i| i + 1);
+    source[line_start..pos].trim_start().starts_with("//")
+}
+
+fn skip_whitespace_and_comments(source: &str, mut idx: usize) -> usize {
+    let bytes = source.as_bytes();
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        } else if source[idx..].starts_with("//") {
+            if let Some(nl) = source[idx..].find('\n') {
+                idx += nl + 1;
+            } else {
+                idx = bytes.len();
+            }
+        } else if source[idx..].starts_with("/*") {
+            if let Some(end) = source[idx + 2..].find("*/") {
+                idx += 2 + end + 2;
+            } else {
+                idx = bytes.len();
+            }
+        } else {
+            break;
+        }
+    }
+    idx
 }
 
 fn added_figure_definition_markup(figure_source: &str) -> String {
@@ -904,6 +1028,9 @@ fn place_deleted_figure_notices(
     report_tree: &Path,
     removed_definitions: &[FigureDefinition],
     removed_label_references: &BTreeSet<String>,
+    emit_anchors: bool,
+    delfig_counter: &mut usize,
+    mut summary_entries: Option<&mut Vec<SummaryEntry>>,
 ) -> Result<Vec<PlacedDeletedFigure>> {
     let definitions: HashMap<&str, &FigureDefinition> = removed_definitions
         .iter()
@@ -915,12 +1042,47 @@ fn place_deleted_figure_notices(
         let Some((source_path, insertion)) = find_deleted_reference_location(report_tree, label)? else {
             continue;
         };
+        let rel_source = source_path
+            .strip_prefix(report_tree)
+            .unwrap_or(&source_path)
+            .to_path_buf();
         let definition = definitions.get(label.as_str()).copied();
-        let box_markup = inline_deleted_figure_box(label, definition);
+        let anchor = if emit_anchors {
+            let a = format!("typdiff:delfig-{}", *delfig_counter);
+            *delfig_counter += 1;
+            Some(a)
+        } else {
+            None
+        };
+        let box_markup = inline_deleted_figure_box(label, definition, anchor.as_deref());
         let mut source = fs::read_to_string(&source_path)?;
         source.insert_str(insertion, &box_markup);
         fs::write(&source_path, source)?;
-        placed.push(PlacedDeletedFigure { label: label.clone() });
+        if let (Some(entries), Some(anchor_id)) = (summary_entries.as_deref_mut(), anchor.as_ref()) {
+            let excerpt = definition
+                .and_then(|d| d.caption.as_deref())
+                .map(clean_caption_excerpt)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    definition
+                        .and_then(|d| d.image_path.as_ref())
+                        .map(|p| normalize_path(p))
+                })
+                .unwrap_or_else(|| format!("<{label}>"));
+            entries.push(SummaryEntry {
+                anchor: anchor_id.clone(),
+                file: rel_source.clone(),
+                kind: "Deleted".to_string(),
+                block_label: "Figure".to_string(),
+                figure_label: Some(label.clone()),
+                context_excerpt: None,
+                old_excerpt: Some(excerpt),
+                new_excerpt: None,
+            });
+        }
+        placed.push(PlacedDeletedFigure {
+            label: label.clone(),
+        });
     }
     Ok(placed)
 }
@@ -936,6 +1098,7 @@ fn find_deleted_reference_location(
         if !entry.file_type().is_file()
             || entry.path().extension() != Some(OsStr::new("typ"))
             || entry.path().file_name() == Some(OsStr::new(".typdiff-notices.typ"))
+            || entry.path().file_name() == Some(OsStr::new(".typdiff-summary.typ"))
         {
             continue;
         }
@@ -964,7 +1127,11 @@ fn paragraph_end(source: &str, position: usize) -> usize {
 fn inline_deleted_figure_box(
     label: &str,
     definition: Option<&FigureDefinition>,
+    anchor: Option<&str>,
 ) -> String {
+    let anchor_line = anchor
+        .map(|a| format!("  #metadata(none) <{a}>\n"))
+        .unwrap_or_default();
     let file = definition
         .and_then(|definition| definition.image_path.as_ref())
         .map(|path| format!(
@@ -990,7 +1157,7 @@ fn inline_deleted_figure_box(
   stroke: 1pt + rgb("b3261e"), fill: rgb("fff4f2"),
   radius: 2pt, breakable: false,
 )[
-  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
+{}  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
   #v(3pt)
   Label: #raw("{}")
 {}{}  #v(5pt)
@@ -1001,6 +1168,7 @@ fn inline_deleted_figure_box(
 #v(5pt)
 
 "#,
+        anchor_line,
         escape_typst_string(label),
         file,
         caption,
@@ -1016,6 +1184,8 @@ fn write_deleted_figure_notices(
     removed_definitions: &[FigureDefinition],
     removed_label_references: &BTreeSet<String>,
     placed_deleted: &[PlacedDeletedFigure],
+    delfig_counter: &mut usize,
+    mut summary_entries: Option<&mut Vec<SummaryEntry>>,
 ) -> Result<usize> {
     // A "deleted figure" can mean either that the binary asset was deleted or that
     // its image(...) reference disappeared while the asset remained in the repository.
@@ -1084,6 +1254,30 @@ fn write_deleted_figure_notices(
         if placed_deleted.iter().any(|placed| placed.label == definition.label) {
             continue;
         }
+        let anchor_line = if let Some(entries) = summary_entries.as_deref_mut() {
+            let anchor = format!("typdiff:delfig-{}", *delfig_counter);
+            *delfig_counter += 1;
+            let excerpt = definition
+                .caption
+                .as_deref()
+                .map(clean_caption_excerpt)
+                .filter(|s| !s.is_empty())
+                .or_else(|| definition.image_path.as_ref().map(|p| normalize_path(p)))
+                .unwrap_or_else(|| format!("<{}>", definition.label));
+            entries.push(SummaryEntry {
+                anchor: anchor.clone(),
+                file: definition.source_file.clone(),
+                kind: "Deleted".to_string(),
+                block_label: "Figure".to_string(),
+                figure_label: Some(definition.label.clone()),
+                context_excerpt: None,
+                old_excerpt: Some(excerpt),
+                new_excerpt: None,
+            });
+            format!("  #metadata(none) <{anchor}>\n")
+        } else {
+            String::new()
+        };
         let file_line = definition
             .image_path
             .as_ref()
@@ -1099,7 +1293,7 @@ fn write_deleted_figure_notices(
   width: 100%, inset: 7pt, stroke: 1pt + rgb("b3261e"),
   fill: rgb("fff4f2"), radius: 2pt, breakable: false,
 )[
-  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
+{}  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
   #v(3pt)
   Label: #raw("{}")
 {}{}  Source: #raw("{}")
@@ -1111,6 +1305,7 @@ fn write_deleted_figure_notices(
 #v(5pt)
 
 "#,
+            anchor_line,
             escape_typst_string(&definition.label),
             file_line,
             caption_line,
@@ -1133,12 +1328,29 @@ fn write_deleted_figure_notices(
         if definition_labels.contains(label.as_str()) {
             continue;
         }
+        let anchor_line = if let Some(entries) = summary_entries.as_deref_mut() {
+            let anchor = format!("typdiff:delfig-{}", *delfig_counter);
+            *delfig_counter += 1;
+            entries.push(SummaryEntry {
+                anchor: anchor.clone(),
+                file: notices_file.to_path_buf(),
+                kind: "Deleted".to_string(),
+                block_label: "Figure".to_string(),
+                figure_label: Some(label.clone()),
+                context_excerpt: None,
+                old_excerpt: Some(format!("<{label}>")),
+                new_excerpt: None,
+            });
+            format!("  #metadata(none) <{anchor}>\n")
+        } else {
+            String::new()
+        };
         appendix.push_str(&format!(
             r#"#block(
   width: 100%, inset: 7pt, stroke: 1pt + rgb("b3261e"),
   fill: rgb("fff4f2"), radius: 2pt, breakable: false,
 )[
-  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
+{}  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
   #v(3pt)
   Label: #raw("{}")
   The figure reference and its corresponding figure were present in the previous version but have been removed from the revised document.
@@ -1146,24 +1358,43 @@ fn write_deleted_figure_notices(
 #v(5pt)
 
 "#,
+            anchor_line,
             escape_typst_string(label)
         ));
     }
 
     for path in deleted_paths.difference(&definition_paths) {
         let path = normalize_path(path);
+        let anchor_line = if let Some(entries) = summary_entries.as_deref_mut() {
+            let anchor = format!("typdiff:delfig-{}", *delfig_counter);
+            *delfig_counter += 1;
+            entries.push(SummaryEntry {
+                anchor: anchor.clone(),
+                file: notices_file.to_path_buf(),
+                kind: "Deleted".to_string(),
+                block_label: "Figure".to_string(),
+                figure_label: None,
+                context_excerpt: None,
+                old_excerpt: Some(path.clone()),
+                new_excerpt: None,
+            });
+            format!("  #metadata(none) <{anchor}>\n")
+        } else {
+            String::new()
+        };
         appendix.push_str(&format!(
             r#"#block(
   width: 100%, inset: 7pt, stroke: 1pt + rgb("b3261e"),
   fill: rgb("fff4f2"), radius: 2pt, breakable: false,
 )[
-  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
+{}  #text(fill: rgb("b3261e"), weight: "bold")[Deleted figure]
   #v(3pt)
   The figure #raw("{}") was present in the previous version but has been removed from the revised document.
 ]
 #v(5pt)
 
 "#,
+            anchor_line,
             escape_typst_string(&path)
         ));
     }
@@ -1211,7 +1442,12 @@ fn write_deleted_figure_notices(
 }
 
 fn escape_typst_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn repository_relative_path(repository_root: &Path, path: &Path) -> Option<PathBuf> {
@@ -1930,7 +2166,8 @@ fn run_typdiff(
     new: &Path,
     target: &Path,
     citation_keys: &BTreeSet<String>,
-) -> Result<()> {
+    summary_prefix: Option<&str>,
+) -> Result<Vec<typdiff::render::SummaryAnchor>> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1954,13 +2191,507 @@ fn run_typdiff(
         .collect();
 
     let diff_results = typdiff::diff::diff(&old_blocks, &new_blocks);
-    let diff_output = typdiff::render::render_with_citations(&diff_results, citation_keys);
+    let (diff_output, anchors) = match summary_prefix {
+        Some(prefix) => typdiff::render::render_with_citations_and_summary(
+            &diff_results,
+            citation_keys,
+            prefix,
+        ),
+        None => (
+            typdiff::render::render_with_citations(&diff_results, citation_keys),
+            Vec::new(),
+        ),
+    };
 
     let sanitized_output = repair_typdiff_brackets(&diff_output);
     let sanitized_output = repair_typdiff_labels(&sanitized_output);
 
     fs::write(target, sanitized_output)
         .with_context(|| format!("writing visual diff to {}", target.display()))?;
+    Ok(anchors)
+}
+
+fn append_summary_anchors(
+    entries: &mut Vec<SummaryEntry>,
+    file: &Path,
+    anchors: Vec<typdiff::render::SummaryAnchor>,
+) {
+    for anchor in anchors {
+        let kind = match anchor.kind {
+            typdiff::render::SummaryChangeKind::Modified => "Modified",
+            typdiff::render::SummaryChangeKind::Added => "Added",
+            typdiff::render::SummaryChangeKind::Deleted => "Deleted",
+        };
+        entries.push(SummaryEntry {
+            anchor: anchor.label,
+            file: file.to_path_buf(),
+            kind: kind.to_string(),
+            block_label: anchor.block_label.to_string(),
+            figure_label: anchor.figure_label,
+            context_excerpt: anchor.context_excerpt,
+            old_excerpt: anchor.old_excerpt,
+            new_excerpt: anchor.new_excerpt,
+        });
+    }
+}
+
+fn clean_caption_excerpt(caption: &str) -> String {
+    let mut cur = caption.trim();
+    loop {
+        if let Some(rest) = cur.strip_prefix("short-cap") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                if let Some(open) = rest.find('[') {
+                    if let Some(close) = find_matching_delimiter(rest, open, '[', ']') {
+                        cur = rest[open + 1..close].trim();
+                        continue;
+                    }
+                }
+            }
+        }
+        let stripped = cur.strip_prefix('#').unwrap_or(cur);
+        if let Some(after_name) = stripped
+            .strip_prefix("text")
+            .or_else(|| stripped.strip_prefix("underline"))
+            .or_else(|| stripped.strip_prefix("emph"))
+            .or_else(|| stripped.strip_prefix("strong"))
+        {
+            let mut rest = after_name.trim_start();
+            if rest.starts_with('(') {
+                if let Some(close_p) = find_matching_delimiter(rest, 0, '(', ')') {
+                    rest = rest[close_p + 1..].trim_start();
+                }
+            }
+            if rest.starts_with('[') {
+                if let Some(close_b) = find_matching_delimiter(rest, 0, '[', ']') {
+                    if close_b + 1 == rest.len() {
+                        cur = rest[1..close_b].trim();
+                        continue;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    let collapsed = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max_chars = 90usize;
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut byte_end = collapsed
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(collapsed.len());
+    if let Some(last_space) = collapsed[..byte_end].rfind(' ') {
+        if last_space > byte_end / 2 {
+            byte_end = last_space;
+        }
+    }
+    format!("{}…", collapsed[..byte_end].trim_end())
+}
+
+fn collect_summary_figure_entries(
+    report_tree: &Path,
+    added_figure_labels: &BTreeSet<String>,
+    typdiff_processed_files: &BTreeSet<PathBuf>,
+    notices_file: &Path,
+    summary_file: &Path,
+    summary_entries: &mut Vec<SummaryEntry>,
+) -> Result<()> {
+    let notices_path = report_tree.join(notices_file);
+    let summary_path = report_tree.join(summary_file);
+    let mut extra_counter = 0usize;
+
+    let mut typ_files = Vec::new();
+    for entry in walkdir::WalkDir::new(report_tree) {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || entry.path().extension() != Some(OsStr::new("typ"))
+            || entry.path().starts_with(report_tree.join(".typdiff-figures"))
+            || entry.path() == notices_path
+            || entry.path() == summary_path
+        {
+            continue;
+        }
+        typ_files.push(entry.path().to_path_buf());
+    }
+    typ_files.sort();
+
+    for path in typ_files {
+        let rel_path = path.strip_prefix(report_tree)?.to_path_buf();
+        let source = fs::read_to_string(&path)?;
+        let ranges = find_figure_definition_ranges_inner(&source, true);
+        let mut covered_ranges: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+
+        for (start, end, label) in ranges {
+            covered_ranges.push((start, end));
+            let block = &source[start..end];
+            let is_added = added_figure_labels.contains(&label);
+            let has_rewritten_fig = block.contains("/.typdiff-figures/");
+            if !is_added && !has_rewritten_fig {
+                continue;
+            }
+            let base_label = if label.starts_with("tab:") || block.contains("table(") {
+                "Table"
+            } else {
+                "Figure"
+            };
+            let caption_ex = extract_caption_content(block)
+                .map(|c| clean_caption_excerpt(&c))
+                .filter(|s| !s.is_empty());
+
+            if let Some(existing) = summary_entries
+                .iter_mut()
+                .find(|e| e.figure_label.as_deref() == Some(label.as_str()))
+            {
+                if has_rewritten_fig && !is_added && existing.old_excerpt.is_some() {
+                    existing.block_label = format!("{base_label} (image + text)");
+                } else {
+                    existing.block_label = base_label.to_string();
+                }
+                if existing.new_excerpt.is_none() {
+                    existing.new_excerpt = caption_ex.or_else(|| Some(format!("<{label}>")));
+                }
+                existing.anchor = label.clone();
+                continue;
+            }
+
+            summary_entries.push(SummaryEntry {
+                anchor: label.clone(),
+                file: rel_path.clone(),
+                kind: if is_added { "Added" } else { "Modified" }.to_string(),
+                block_label: base_label.to_string(),
+                figure_label: Some(label.clone()),
+                context_excerpt: None,
+                old_excerpt: None,
+                new_excerpt: caption_ex.or_else(|| Some(format!("<{label}>"))),
+            });
+        }
+
+        // Unlabeled image changes inside files already processed by run_typdiff are
+        // already anchored there; only scan outside-figure assets in untouched files.
+        if typdiff_processed_files.contains(&rel_path) {
+            continue;
+        }
+
+        // Also detect rewritten /.typdiff-figures/... calls outside labeled #figure(...) blocks.
+        let mut extra_insertions: Vec<(usize, String)> = Vec::new();
+        let mut unanchored_extras: Vec<String> = Vec::new();
+        for (lit_start, lit_end, literal) in extract_string_literal_ranges(&source) {
+            if !literal.contains("/.typdiff-figures/") {
+                continue;
+            }
+            if is_inside_line_comment(&source, lit_start) {
+                continue;
+            }
+            if covered_ranges
+                .iter()
+                .any(|&(s, e)| lit_start >= s && lit_end <= e)
+            {
+                continue;
+            }
+            let file_name = Path::new(&literal)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&literal)
+                .to_string();
+            if let Some(hash_pos) = find_enclosing_markup_hash(&source, lit_start) {
+                let anchor = format!("typdiff:fig-extra-{extra_counter}");
+                extra_counter += 1;
+                extra_insertions.push((hash_pos, format!("#metadata(none) <{anchor}>")));
+                summary_entries.push(SummaryEntry {
+                    anchor,
+                    file: rel_path.clone(),
+                    kind: "Modified".to_string(),
+                    block_label: "Figure".to_string(),
+                    figure_label: None,
+                    context_excerpt: None,
+                    old_excerpt: None,
+                    new_excerpt: Some(file_name),
+                });
+            } else {
+                unanchored_extras.push(file_name);
+            }
+        }
+        if !extra_insertions.is_empty() {
+            extra_insertions.sort_by_key(|(pos, _)| *pos);
+            extra_insertions.dedup_by_key(|(pos, _)| *pos);
+            let mut updated = source;
+            for (pos, marker) in extra_insertions.into_iter().rev() {
+                updated.insert_str(pos, &marker);
+            }
+            fs::write(&path, updated)?;
+        }
+        for file_name in unanchored_extras {
+            summary_entries.push(SummaryEntry {
+                anchor: String::new(),
+                file: rel_path.clone(),
+                kind: "Modified".to_string(),
+                block_label: "Figure".to_string(),
+                figure_label: None,
+                context_excerpt: None,
+                old_excerpt: None,
+                new_excerpt: Some(file_name),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn find_enclosing_markup_hash(source: &str, target_byte: usize) -> Option<usize> {
+    fn walk(
+        node: &typst_syntax::SyntaxNode,
+        offset: usize,
+        in_markup: bool,
+        target: usize,
+    ) -> Option<usize> {
+        use typst_syntax::SyntaxKind;
+        let children: Vec<_> = node.children().collect();
+        if in_markup {
+            let mut child_offset = offset;
+            let mut i = 0usize;
+            while i < children.len() {
+                let child = children[i];
+                if child.kind() == SyntaxKind::Hash && i + 1 < children.len() {
+                    let next = children[i + 1];
+                    let expr_start = child_offset + child.len();
+                    let expr_end = expr_start + next.len();
+                    if target >= expr_start && target < expr_end {
+                        return Some(child_offset);
+                    }
+                }
+                if target >= child_offset && target < child_offset + child.len() {
+                    let child_markup = matches!(
+                        child.kind(),
+                        SyntaxKind::Markup
+                            | SyntaxKind::ContentBlock
+                            | SyntaxKind::Strong
+                            | SyntaxKind::Emph
+                            | SyntaxKind::Heading
+                            | SyntaxKind::ListItem
+                            | SyntaxKind::EnumItem
+                            | SyntaxKind::TermItem
+                    );
+                    return walk(child, child_offset, child_markup, target);
+                }
+                child_offset += child.len();
+                i += 1;
+            }
+            None
+        } else {
+            let mut child_offset = offset;
+            for child in children {
+                if target >= child_offset && target < child_offset + child.len() {
+                    let child_markup = child.kind() == SyntaxKind::ContentBlock;
+                    return walk(child, child_offset, child_markup, target);
+                }
+                child_offset += child.len();
+            }
+            None
+        }
+    }
+
+    let root = typst_syntax::parse(source);
+    walk(&root, 0, true, target_byte)
+}
+
+fn write_summary_page(
+    main_file: &Path,
+    report_tree: &Path,
+    summary_file: &Path,
+    old_rev: &str,
+    new_rev: &str,
+    entries: &[SummaryEntry],
+) -> Result<()> {
+    let mut entries_typ = String::new();
+    for entry in entries {
+        let file = escape_typst_string(&normalize_path(&entry.file));
+        let kind = escape_typst_string(&entry.kind);
+        let block = escape_typst_string(&entry.block_label);
+        let anchor = escape_typst_string(&entry.anchor);
+        let ctx = escape_typst_string(entry.context_excerpt.as_deref().unwrap_or(""));
+        let old_ex = escape_typst_string(entry.old_excerpt.as_deref().unwrap_or(""));
+        let new_ex = escape_typst_string(entry.new_excerpt.as_deref().unwrap_or(""));
+        entries_typ.push_str(&format!(
+            "    (anchor: \"{anchor}\", file: \"{file}\", kind: \"{kind}\", block: \"{block}\", ctx: \"{ctx}\", old: \"{old_ex}\", new: \"{new_ex}\"),\n"
+        ));
+    }
+
+    let summary_source = format!(
+        r##"#page(
+  margin: (x: 16mm, y: 16mm),
+  numbering: none,
+  header: none,
+  footer: none,
+)[
+  #set par(first-line-indent: 0pt, justify: false, spacing: 0.45em, leading: 0.4em)
+  #set text(size: 9pt)
+  #let typdiff-format-page(loc) = {{
+    let num = counter(page).at(loc)
+    let pat = loc.page-numbering()
+    if pat == none {{
+      [front #numbering("1", ..num)]
+    }} else {{
+      numbering(pat, ..num)
+    }}
+  }}
+  #let typdiff-plain-text(body) = {{
+    if body == none {{ "" }}
+    else if type(body) == str {{ body }}
+    else if body.func() == footnote or body.func() == metadata {{ "" }}
+    else if body.has("text") {{ body.text }}
+    else if body.func() == [ ].func() or body.func() == [~].func() {{ " " }}
+    else if body.has("children") {{ body.children.map(typdiff-plain-text).join("") }}
+    else if body.has("body") {{ typdiff-plain-text(body.body) }}
+    else if body.has("child") {{ typdiff-plain-text(body.child) }}
+    else {{ "" }}
+  }}
+  #let typdiff-section-of(loc) = {{
+    let hs = query(selector(heading).before(loc))
+    if hs.len() > 0 {{
+      let txt = typdiff-plain-text(hs.last().body).trim()
+      let parts = txt.clusters()
+      if parts.len() > 60 {{
+        parts.slice(0, 60).join("") + "…"
+      }} else {{
+        txt
+      }}
+    }} else {{
+      ""
+    }}
+  }}
+
+  #text(size: 16pt, weight: "bold")[Revision Summary]
+  #v(2pt)
+  #text(size: 8.5pt, fill: rgb("#555555"))[
+    Comparing #raw("{}") → #raw("{}")
+    #h(1em) | #h(1em)
+    {} change(s)
+  ]
+  #v(6pt)
+
+  #context {{
+    let entries = (
+{}    )
+    if entries.len() == 0 {{
+      text(fill: rgb("#555555"))[No differences detected between the two revisions.]
+    }} else {{
+      let resolved = ()
+      for (seq, e) in entries.enumerate() {{
+        let hits = if e.anchor != "" {{ query(label(e.anchor)) }} else {{ () }}
+        if hits.len() > 0 {{
+          let loc = hits.first().location()
+          resolved.push((entry: e, loc: loc, page: loc.page(), y: loc.position().y.pt(), seq: seq))
+        }} else {{
+          resolved.push((entry: e, loc: none, page: 999999, y: 0.0, seq: seq))
+        }}
+      }}
+      let sorted = resolved.sorted(key: it => (it.page, it.y, it.seq))
+      table(
+        columns: (auto, auto, 1fr, auto),
+        stroke: 0.4pt + rgb("#dddddd"),
+        inset: (x: 5pt, y: 4pt),
+        align: (right, left, left, right),
+        fill: (col, row) => if row == 0 {{ rgb("#f3f4f6") }} else {{ none }},
+        table.header(
+          [*\#*],
+          [*Change*],
+          [*Location & Excerpt*],
+          [*Page*],
+        ),
+        ..sorted.enumerate().map(((idx, item)) => {{
+          let e = item.entry
+          let kind-color = if e.kind == "Added" {{
+            rgb("#0067c0")
+          }} else if e.kind == "Deleted" {{
+            rgb("#b3261e")
+          }} else {{
+            rgb("#6b21a8")
+          }}
+          let sec = if item.loc != none {{ typdiff-section-of(item.loc) }} else {{ "" }}
+          let loc-header = if sec != "" {{
+            [#raw(e.file) #text(fill: rgb("#666666"))[· #sec]]
+          }} else {{
+            [#raw(e.file)]
+          }}
+          let excerpt-body = {{
+            if e.ctx != "" {{
+              text(fill: rgb("#666666"), e.ctx)
+              [ ]
+            }}
+            if e.old != "" {{
+              strike(text(fill: rgb("#cc0000"), e.old))
+            }}
+            if e.old != "" and e.new != "" {{
+              [ → ]
+            }}
+            if e.new != "" {{
+              underline(text(fill: rgb("#0000ff"), e.new))
+            }}
+          }}
+          let page-cell = if item.loc != none {{
+            link(item.loc)[#text(fill: rgb("#0067c0"), weight: "bold")[p. #typdiff-format-page(item.loc)]]
+          }} else {{
+            text(fill: rgb("#888888"))[—]
+          }}
+          (
+            [#(idx + 1)],
+            [
+              #text(fill: kind-color, weight: "bold")[#e.kind]\
+              #text(size: 8pt, fill: rgb("#555555"))[#e.block]
+            ],
+            [
+              #text(size: 8pt, fill: rgb("#555555"))[#loc-header]\
+              #excerpt-body
+            ],
+            page-cell,
+          )
+        }}).flatten()
+      )
+    }}
+  }}
+]
+#counter(page).update(1)
+"##,
+        escape_typst_string(old_rev),
+        escape_typst_string(new_rev),
+        entries.len(),
+        entries_typ,
+    );
+
+    let summary_path = report_tree.join(summary_file);
+    if let Some(parent) = summary_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&summary_path, summary_source)
+        .with_context(|| format!("writing {}", summary_path.display()))?;
+
+    let include_path = if summary_file.is_absolute() {
+        normalize_path(summary_file)
+    } else {
+        format!("/{}", normalize_path(summary_file))
+    };
+    let main = fs::read_to_string(main_file)
+        .with_context(|| format!("reading {}", main_file.display()))?;
+    let include_stmt = format!("#include \"{}\"\n", include_path);
+    let updated = if main.starts_with("#!") {
+        if let Some(nl) = main.find('\n') {
+            let mut s = String::with_capacity(main.len() + include_stmt.len());
+            s.push_str(&main[..=nl]);
+            s.push_str(&include_stmt);
+            s.push_str(&main[nl + 1..]);
+            s
+        } else {
+            format!("{main}\n{include_stmt}")
+        }
+    } else {
+        format!("{include_stmt}{main}")
+    };
+    fs::write(main_file, updated)
+        .with_context(|| format!("including summary page from {}", main_file.display()))?;
+    eprintln!("summary page source: {}", summary_path.display());
     Ok(())
 }
 fn neutralize_one_sided_references(
@@ -2711,5 +3442,144 @@ mod tests {
         assert!(!neutralized_old.contains("`@smirnov2015`"));
         // @old_figure should be wrapped in backticks because it disappeared and is not a citation
         assert!(neutralized_old.contains("`@old_figure`"));
+    }
+
+    #[test]
+    fn test_summary_page_cli_generates_compilable_pdf_with_logical_pages_and_figures() {
+        use std::process::Command;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        };
+
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+
+        let svg_v1 = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="red"/></svg>"##;
+        let svg_v2 = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="blue"/></svg>"##;
+        fs::write(root.join("fig_mod.svg"), svg_v1).unwrap();
+        fs::write(root.join("fig_del.svg"), svg_v1).unwrap();
+
+        fs::write(
+            root.join("main.typ"),
+            r#"#set page(numbering: "i")
+#counter(page).update(1)
+#include "/front.typ"
+#pagebreak()
+#set page(numbering: "1")
+#counter(page).update(1)
+#set heading(numbering: "1.")
+#include "/chap1.typ"
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("front.typ"), "Old abstract sentence.\n").unwrap();
+        fs::write(
+            root.join("chap1.typ"),
+            r#"= Chapter One <sec:ch1>
+
+First paragraph with old word.
+
+#figure(image("/fig_mod.svg"), caption: [Modified fig caption]) <fig:mod>
+
+#figure(image("/fig_del.svg"), caption: [Deleted fig caption]) <fig:del>
+
+See #figure([old], caption: [Old tbl]) <tab:tbl1>.
+"#,
+        )
+        .unwrap();
+        // Keep chap1 valid Typst for both revisions.
+        fs::write(
+            root.join("chap1.typ"),
+            r#"= Chapter One <sec:ch1>
+
+First paragraph with old word.
+
+#figure(image("/fig_mod.svg"), caption: [Modified fig caption]) <fig:mod>
+
+#figure(image("/fig_del.svg"), caption: [Deleted fig caption]) <fig:del>
+
+#figure(table(columns: 2, [A], [B]), caption: [My table]) <tab:tbl1>
+
+Reference to @fig:del here.
+"#,
+        )
+        .unwrap();
+
+        git(&["add", "."]);
+        git(&["commit", "-m", "v1"]);
+
+        // Make v2 changes in worktree.
+        fs::write(root.join("fig_mod.svg"), svg_v2).unwrap();
+        fs::write(root.join("fig_add.svg"), svg_v2).unwrap();
+        fs::write(root.join("front.typ"), "New abstract sentence.\n").unwrap();
+        fs::write(
+            root.join("chap1.typ"),
+            r#"= Chapter One <sec:ch1>
+
+First paragraph with new word.
+
+#figure(image("/fig_mod.svg"), caption: [Modified fig caption]) <fig:mod>
+
+#figure(image("/fig_add.svg"), caption: [Added fig caption]) <fig:add>
+
+#figure(table(columns: 2, [A], [C]), caption: [My table]) <tab:tbl1>
+
+Reference removed.
+"#,
+        )
+        .unwrap();
+
+        let debug_dir = root.join(".debug");
+        let out_pdf = root.join("diff-summary.pdf");
+        let cli = Cli {
+            old: "HEAD".to_string(),
+            new: "WORKTREE".to_string(),
+            main: PathBuf::from("main.typ"),
+            output: out_pdf.clone(),
+            watch: false,
+            repository: Some(root.to_path_buf()),
+            paths: Vec::new(),
+            excludes: Vec::new(),
+            image_functions: Vec::new(),
+            debug_dir: Some(debug_dir.clone()),
+            notices_file: PathBuf::from(".typdiff-notices.typ"),
+            summary_page: true,
+            summary_file: PathBuf::from(".typdiff-summary.typ"),
+        };
+        let repo = Repository::discover(Some(root)).unwrap();
+        let image_functions = normalized_image_functions(&cli.image_functions).unwrap();
+        let debug_repo_prefix = repository_relative_path(repo.root(), &debug_dir);
+        generate_diff(
+            &cli,
+            &repo,
+            &image_functions,
+            &out_pdf,
+            debug_repo_prefix.as_deref(),
+        )
+        .unwrap();
+
+        assert!(out_pdf.is_file(), "expected output PDF to be created");
+        let summary_typ = fs::read_to_string(debug_dir.join("report/.typdiff-summary.typ")).unwrap();
+        assert!(summary_typ.contains("\"old\""), "summary missing modified old excerpt: {summary_typ}");
+        assert!(summary_typ.contains("\"new\""), "summary missing modified new excerpt: {summary_typ}");
+        assert!(summary_typ.contains("Modified fig caption"), "summary missing modified figure: {summary_typ}");
+        assert!(summary_typ.contains("Added fig caption"), "summary missing added figure: {summary_typ}");
+        assert!(!summary_typ.contains("#underline[Added fig caption]"), "caption wrapper should be stripped: {summary_typ}");
+        assert!(!summary_typ.contains("fig-extra-"), "should not emit duplicate figure entry: {summary_typ}");
+        assert!(summary_typ.contains("Deleted fig caption"), "summary missing deleted figure: {summary_typ}");
+        assert!(summary_typ.contains("block: \"Table\""), "summary missing modified table kind: {summary_typ}");
+        assert!(summary_typ.contains("old: \"B\", new: \"C\""), "summary missing table cell diff: {summary_typ}");
+        assert!(summary_typ.contains("typdiff-format-page"), "summary missing logical page formatter");
     }
 }
