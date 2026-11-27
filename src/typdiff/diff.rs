@@ -334,7 +334,7 @@ fn typst_atomic_ranges(s: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Perform mixed-granularity diff and return coalesced spans.
+/// Perform mixed-granularity diff and return coalesced, reordered spans.
 ///
 /// Uses a custom tokenizer that splits CJK characters individually while
 /// keeping ASCII words intact, then diffs at the token level.
@@ -356,7 +356,7 @@ fn word_diff(old_text: &str, new_text: &str) -> Vec<DiffSpan> {
         })
         .collect();
 
-    coalesce_spans(raw_spans)
+    reorder_spans(absorb_short_equals(coalesce_spans(raw_spans)))
 }
 
 /// Merge adjacent spans that have the same tag.
@@ -370,6 +370,107 @@ fn coalesce_spans(spans: Vec<DiffSpan>) -> Vec<DiffSpan> {
             }
         }
         result.push(span);
+    }
+    result
+}
+
+/// Maximum byte-length of an Equal span that may be absorbed into a surrounding
+/// change block by [`absorb_short_equals`].  Spans longer than this are treated
+/// as genuine separators between independent edits.
+///
+/// 15 bytes covers common English glue tokens such as " the ", " of ", " a ",
+/// " and ", " in " while leaving substantive phrases intact.
+const MAX_ABSORBABLE_EQUAL_BYTES: usize = 15;
+
+/// Absorb short Equal spans that are sandwiched between non-Equal spans.
+///
+/// When a brief unchanged token (e.g. " the ") sits between two edited regions,
+/// it prevents [`reorder_spans`] from grouping those regions into a single
+/// readable change block.  This function converts such spans into a
+/// Deleted+Inserted pair carrying the same text, so that the subsequent
+/// [`reorder_spans`] pass can merge everything into one block:
+///
+///   Before: Del "b " | Ins "B " | Equal "the " | Del "c" | Ins "C"
+///   After:  Del "b " | Ins "B " | Del "the " | Ins "the " | Del "c" | Ins "C"
+///   →reorder: Del "b the c" | Ins "B the C"
+///
+/// Only Equal spans that are both short enough (≤ [`MAX_ABSORBABLE_EQUAL_BYTES`])
+/// **and** surrounded by non-Equal spans on both sides are absorbed.
+/// Leading/trailing Equal spans are never touched.
+fn absorb_short_equals(spans: Vec<DiffSpan>) -> Vec<DiffSpan> {
+    let n = spans.len();
+    let mut result = Vec::with_capacity(n + 4);
+
+    for (i, span) in spans.iter().enumerate() {
+        if span.tag == SpanTag::Equal
+            && span.text.len() <= MAX_ABSORBABLE_EQUAL_BYTES
+            && i > 0
+            && i + 1 < n
+            && spans[i - 1].tag != SpanTag::Equal
+            && spans[i + 1].tag != SpanTag::Equal
+        {
+            // Absorb: emit as both Deleted and Inserted so reorder_spans can
+            // merge this token with the adjacent change blocks.
+            result.push(DiffSpan {
+                tag: SpanTag::Deleted,
+                text: span.text.clone(),
+            });
+            result.push(DiffSpan {
+                tag: SpanTag::Inserted,
+                text: span.text.clone(),
+            });
+        } else {
+            result.push(span.clone());
+        }
+    }
+    result
+}
+
+/// Within each contiguous block of changed spans (Deleted/Inserted, with no
+/// Equal span between them), collect all Deleted text first and all Inserted
+/// text second.  This prevents interleaved patterns such as
+///
+///   #diff-deleted[b ]#diff-added[B ]#diff-deleted[c]#diff-added[C]
+///
+/// and produces the more readable:
+///
+///   #diff-deleted[b c]#diff-added[B C]
+///
+/// Call [`absorb_short_equals`] before this function so that brief glue tokens
+/// between adjacent edits do not fragment the change blocks.
+fn reorder_spans(spans: Vec<DiffSpan>) -> Vec<DiffSpan> {
+    let mut result: Vec<DiffSpan> = Vec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        if spans[i].tag == SpanTag::Equal {
+            result.push(spans[i].clone());
+            i += 1;
+        } else {
+            // Collect a contiguous block of non-Equal (Deleted/Inserted) spans.
+            let mut deleted = String::new();
+            let mut inserted = String::new();
+            while i < spans.len() && spans[i].tag != SpanTag::Equal {
+                match spans[i].tag {
+                    SpanTag::Deleted => deleted.push_str(&spans[i].text),
+                    SpanTag::Inserted => inserted.push_str(&spans[i].text),
+                    SpanTag::Equal => unreachable!(),
+                }
+                i += 1;
+            }
+            // Emit Deleted before Inserted so the output is never interleaved.
+            if !deleted.is_empty() {
+                result.push(DiffSpan {
+                    tag: SpanTag::Deleted,
+                    text: deleted,
+                });
+            }
+            if !inserted.is_empty() {
+                result.push(DiffSpan {
+                    tag: SpanTag::Inserted,
+                    text: inserted,
+                });
+            }
+        }
     }
     result
 }
@@ -715,6 +816,85 @@ mod tests {
         } else {
             panic!("expected Modified, got: {:?}", results[0]);
         }
+    }
+
+    #[test]
+    fn test_reorder_spans_groups_consecutive_changes() {
+        // "a b c" vs "a B C": both 'b' and 'c' are replaced.
+        // After reordering the change block should be [Del("b c"), Ins("B C")],
+        // NOT [Del("b "), Ins("B "), Del("c"), Ins("C")].
+        let spans = word_diff("a b c", "a B C");
+        // Within any contiguous non-Equal block, Deleted must precede Inserted.
+        let mut seen_inserted = false;
+        for span in &spans {
+            match span.tag {
+                SpanTag::Equal => {
+                    seen_inserted = false;
+                }
+                SpanTag::Deleted => {
+                    assert!(
+                        !seen_inserted,
+                        "Deleted span must not follow Inserted within a change block: {spans:?}"
+                    );
+                }
+                SpanTag::Inserted => {
+                    seen_inserted = true;
+                }
+            }
+        }
+        // Additionally, the Deleted span should contain both "b" and "c".
+        let deleted_text: String = spans
+            .iter()
+            .filter(|s| s.tag == SpanTag::Deleted)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            deleted_text.contains('b') && deleted_text.contains('c'),
+            "all deleted tokens should be grouped: {deleted_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_reorder_spans_short_equal_absorbed() {
+        // A short Equal span ("a") sandwiched between two change regions is
+        // absorbed by absorb_short_equals, so both change regions are merged
+        // into a single block.
+        // "X b a c Y" vs "X B a C Y": 'b'→'B' and 'c'→'C' with short "a" in between.
+        let spans = word_diff("X b a c Y", "X B a C Y");
+        // With absorption, there should be exactly ONE change block between the
+        // leading "X " and trailing " Y" Equal spans.
+        let mut blocks = 0usize;
+        let mut in_block = false;
+        for span in &spans {
+            if span.tag == SpanTag::Equal {
+                in_block = false;
+            } else if !in_block {
+                blocks += 1;
+                in_block = true;
+            }
+        }
+        assert_eq!(blocks, 1, "short equal should be absorbed into one block: {spans:?}");
+    }
+
+    #[test]
+    fn test_reorder_spans_long_equal_keeps_separate() {
+        // A long Equal span (> MAX_ABSORBABLE_EQUAL_BYTES) must NOT be absorbed;
+        // the two change regions stay independent.
+        // Use a 20-character equal separator that clearly exceeds the threshold.
+        let old = "changed_old one two three four five rest_old";
+        let new = "changed_new one two three four five rest_new";
+        let spans = word_diff(old, new);
+        let mut blocks = 0usize;
+        let mut in_block = false;
+        for span in &spans {
+            if span.tag == SpanTag::Equal {
+                in_block = false;
+            } else if !in_block {
+                blocks += 1;
+                in_block = true;
+            }
+        }
+        assert_eq!(blocks, 2, "long equal should keep change regions separate: {spans:?}");
     }
 
     #[test]

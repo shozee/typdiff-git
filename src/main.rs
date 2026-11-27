@@ -2263,9 +2263,42 @@ fn replace_tokens_with_raw(source: &str, tokens: &BTreeSet<String>) -> String {
     ordered.sort_by_key(|token| std::cmp::Reverse(token.len()));
     for token in ordered {
         let fence = raw_fence(token);
-        result = result.replace(token, &format!("{fence}{token}{fence}"));
+        let wrapped = format!("{fence}{token}{fence}");
+        let is_bare_ref = token.starts_with('@') && !token.starts_with("@<");
+        let mut out = String::with_capacity(result.len());
+        let mut cursor = 0usize;
+        while let Some(rel) = result[cursor..].find(token.as_str()) {
+            let start = cursor + rel;
+            let end = start + token.len();
+            let prev_char = result[..start].chars().next_back();
+            let preceded_by_raw_or_escape = matches!(prev_char, Some('`') | Some('\\'));
+            let extends_label = is_bare_ref && is_ref_continued_at(&result[end..]);
+            if preceded_by_raw_or_escape || extends_label {
+                out.push_str(&result[cursor..end]);
+            } else {
+                out.push_str(&result[cursor..start]);
+                out.push_str(&wrapped);
+            }
+            cursor = end;
+        }
+        out.push_str(&result[cursor..]);
+        result = out;
     }
     result
+}
+
+fn is_ref_continued_at(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_alphanumeric() || matches!(first, '_' | '-') {
+        return true;
+    }
+    if matches!(first, '.' | ':') {
+        return chars.next().is_some_and(is_label_char);
+    }
+    false
 }
 
 fn raw_fence(value: &str) -> String {
@@ -2294,15 +2327,68 @@ fn absolute_output(path: &Path) -> Result<PathBuf> {
 }
 
 fn repair_typdiff_brackets(source: &str) -> String {
+    let unclosed_ranges = unclosed_diff_block_ranges(source);
+    if unclosed_ranges.is_empty() {
+        return source.to_string();
+    }
     let mut result = Vec::new();
-    for line in source.lines() {
-        result.push(fix_line_bracket_balance(line));
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        let line_end = line_start + trimmed.len();
+        let intersects_unclosed = unclosed_ranges
+            .iter()
+            .any(|&(start, end)| start <= line_end && line_start < end);
+        if intersects_unclosed {
+            result.push(fix_line_bracket_balance(trimmed));
+        } else {
+            result.push(trimmed.to_string());
+        }
+        line_start += line.len();
+    }
+    if source.is_empty() {
+        return String::new();
     }
     let mut joined = result.join("\n");
     if source.ends_with('\n') {
         joined.push('\n');
     }
     joined
+}
+
+fn unclosed_diff_block_ranges(source: &str) -> Vec<(usize, usize)> {
+    fn walk(node: &typst_syntax::SyntaxNode, offset: usize, ranges: &mut Vec<(usize, usize)>) {
+        let is_diff_call = node.kind() == typst_syntax::SyntaxKind::FuncCall
+            && node.children().next().is_some_and(|callee| {
+                callee.kind() == typst_syntax::SyntaxKind::Ident
+                    && matches!(callee.text().as_str(), "diff-added" | "diff-deleted")
+            });
+        if is_diff_call {
+            let has_unclosed = node.children().any(|child| {
+                child.kind() == typst_syntax::SyntaxKind::Args
+                    && child.children().any(|arg| {
+                        arg.kind() == typst_syntax::SyntaxKind::ContentBlock
+                            && !arg
+                                .children()
+                                .last()
+                                .is_some_and(|last| last.kind() == typst_syntax::SyntaxKind::RightBracket)
+                    })
+            });
+            if has_unclosed {
+                ranges.push((offset, offset + node.len()));
+            }
+        }
+        let mut child_offset = offset;
+        for child in node.children() {
+            walk(child, child_offset, ranges);
+            child_offset += child.len();
+        }
+    }
+
+    let root = typst_syntax::parse(source);
+    let mut ranges = Vec::new();
+    walk(&root, 0, &mut ranges);
+    ranges
 }
 
 fn fix_line_bracket_balance(line: &str) -> String {
@@ -2401,30 +2487,7 @@ fn fix_line_bracket_balance(line: &str) -> String {
 }
 
 fn repair_typdiff_labels(source: &str) -> String {
-    let mut blocks = Vec::new();
-    let mut search_from = 0;
-    while search_from < source.len() {
-        let next_added = source[search_from..].find("#diff-added[").map(|i| search_from + i);
-        let next_deleted = source[search_from..].find("#diff-deleted[").map(|i| search_from + i);
-        let next_pos = match (next_added, next_deleted) {
-            (Some(a), Some(d)) => Some(a.min(d)),
-            (Some(a), None) => Some(a),
-            (None, Some(d)) => Some(d),
-            (None, None) => None,
-        };
-        let Some(pos) = next_pos else { break; };
-        let open_bracket = if source[pos..].starts_with("#diff-added[") {
-            pos + "#diff-added[".len() - 1
-        } else {
-            pos + "#diff-deleted[".len() - 1
-        };
-        if let Some(close_bracket) = find_matching_delimiter(source, open_bracket, '[', ']') {
-            blocks.push(close_bracket);
-            search_from = close_bracket + 1;
-        } else {
-            search_from = open_bracket + 1;
-        }
-    }
+    let blocks = collect_diff_block_close_offsets(source);
 
     let mut result = source.to_string();
     for close_bracket in blocks.into_iter().rev() {
@@ -2489,6 +2552,42 @@ fn repair_typdiff_labels(source: &str) -> String {
     result
 }
 
+fn collect_diff_block_close_offsets(source: &str) -> Vec<usize> {
+    fn walk(node: &typst_syntax::SyntaxNode, offset: usize, closes: &mut Vec<usize>) {
+        let is_diff_call = node.kind() == typst_syntax::SyntaxKind::FuncCall
+            && node.children().next().is_some_and(|callee| {
+                callee.kind() == typst_syntax::SyntaxKind::Ident
+                    && matches!(callee.text().as_str(), "diff-added" | "diff-deleted")
+            });
+        let mut child_offset = offset;
+        for child in node.children() {
+            if is_diff_call && child.kind() == typst_syntax::SyntaxKind::Args {
+                let mut arg_offset = child_offset;
+                for arg in child.children() {
+                    walk(arg, arg_offset, closes);
+                    if arg.kind() == typst_syntax::SyntaxKind::ContentBlock {
+                        let is_closed = arg.children().last().is_some_and(|last| {
+                            last.kind() == typst_syntax::SyntaxKind::RightBracket
+                        });
+                        if is_closed {
+                            closes.push(arg_offset + arg.len() - 1);
+                        }
+                    }
+                    arg_offset += arg.len();
+                }
+            } else {
+                walk(child, child_offset, closes);
+            }
+            child_offset += child.len();
+        }
+    }
+
+    let root = typst_syntax::parse(source);
+    let mut closes = Vec::new();
+    walk(&root, 0, &mut closes);
+    closes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2505,6 +2604,36 @@ mod tests {
         let ok = "one #diff-deleted[[two]] four";
         let fixed = repair_typdiff_brackets(ok);
         assert_eq!(fixed, ok);
+    }
+
+    #[test]
+    fn test_repair_typdiff_brackets_preserves_multiline_raw_math_and_strings() {
+        let multiline = "#diff-added[line one [a\nline two b]]";
+        assert_eq!(repair_typdiff_brackets(multiline), multiline);
+
+        let raw_and_math = "#diff-deleted[`[` and #text(\"[\") and $ [0, 1) $]";
+        assert_eq!(repair_typdiff_brackets(raw_and_math), raw_and_math);
+    }
+
+    #[test]
+    fn test_repair_typdiff_labels_with_quotes_escapes_and_raw() {
+        let source = r#"#diff-added[5" display with \] and `[`]<fig:test>"#;
+        let fixed = repair_typdiff_labels(source);
+        assert_eq!(fixed, r#"#diff-added[5" display with \] and `[`<fig:test>]"#);
+    }
+
+    #[test]
+    fn test_replace_tokens_with_raw_respects_ref_boundaries() {
+        let mut citation_keys = BTreeSet::new();
+        citation_keys.insert("cite2024".to_string());
+        let old = "See @fig:1 and @fig:10 and @fig:1_extra and @cite2024.";
+        let new = "See @fig:10 and @fig:1_extra.";
+        let (neutralized, _) = neutralize_one_sided_references(old, new, &citation_keys);
+        assert!(neutralized.contains("`@fig:1`"));
+        assert!(neutralized.contains("@fig:10"));
+        assert!(!neutralized.contains("`@fig:1`0"));
+        assert!(neutralized.contains("@fig:1_extra"));
+        assert!(!neutralized.contains("`@fig:1`_extra"));
     }
 
     #[test]

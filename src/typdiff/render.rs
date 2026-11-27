@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
+use typst_syntax::{SyntaxKind, SyntaxNode};
 
 use super::{Block, BlockKind, DiffResult, DiffSpan, SpanTag, TypstLabel};
 
@@ -354,128 +355,194 @@ fn write_enum_prefix(number: Option<usize>, out: &mut String) {
 
 /// Escape content so it can safely be placed inside a Typst content block `[...]`.
 ///
-/// - Tracks bracket depth so that balanced `[...]` pairs are left untouched.
-/// - Unbalanced `]` is escaped as `\]`.
+/// Uses `typst_syntax` so Typst's mode boundaries (markup, code, math, raw,
+/// strings, escapes, links, and comments) are respected:
+/// - Balanced `[...]` pairs in markup are left untouched; unmatched `[` or `]`
+///   in markup are escaped as `\[` or `\]`.
+/// - Code-mode expressions (e.g. `#Fig(<label>)`, `#ref(<label>)`,
+///   `#cite(<key>)`, string literals) are never modified with backslashes,
+///   avoiding invalid `\` characters in Typst code, while markup inside nested
+///   content blocks (`#footnote[...]`, `#citet[...]`, etc.) is still escaped.
+/// - Raw blocks/inlines, math equations, escapes, URLs, and comments are left
+///   intact.
+/// - If the content ends inside a line comment without a trailing newline, a
+///   newline is appended so the caller's closing `]` is not commented out.
 /// - If the content ends with an odd number of backslashes, a trailing space is
 ///   appended to prevent the closing `]` from being interpreted as `\]`.
-/// - When `escape_refs` is true, `@` is escaped as `\@` and `<` is escaped
-///   as `\<` to suppress reference resolution and label creation (used for
-///   deleted content where the referenced label may no longer exist or would
-///   create duplicates). However, if an `@` reference or `<label>` argument
-///   corresponds to a known bibliography citation, it is left bare so Typst
-///   resolves the formatted citation. Label literals inside `#ref(<label>, ...)`
-///   or `#cite(<label>, ...)` are also left unchanged.
+/// - When `escape_refs` is true, markup `@` references (other than known
+///   bibliography citation keys) are escaped as `\@` and markup `<label>`
+///   anchors are escaped as `\<label>`.
 fn escape_content(
     s: &str,
     escape_refs: bool,
     citation_keys: &BTreeSet<String>,
 ) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut depth: i32 = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' => {
-                depth += 1;
-                result.push(ch);
-            }
-            ']' => {
-                if depth > 0 {
-                    depth -= 1;
-                    result.push(ch);
-                } else {
-                    result.push('\\');
-                    result.push(']');
-                }
-            }
-            '@' if escape_refs => {
-                let rest = &s[i + 1..];
-                if extract_citation_key_at_cursor(rest, citation_keys).is_some() {
-                    result.push('@');
-                } else {
-                    result.push('\\');
-                    result.push('@');
-                }
-            }
-            // Bare deleted labels are escaped so they do not create anchors.
-            // In `#ref(<label>, ...)` or `#cite(...)`, though, the label is code and must stay bare.
-            '<' if escape_refs && !is_ref_or_cite_label_arg(s, i, citation_keys) => {
-                result.push('\\');
-                result.push('<');
-            }
-            _ => result.push(ch),
-        }
+    let root = typst_syntax::parse(s);
+    let mut out = String::with_capacity(s.len());
+    let mut ends_with_line_comment = false;
+    escape_node(
+        &root,
+        true,
+        escape_refs,
+        citation_keys,
+        &mut out,
+        &mut ends_with_line_comment,
+    );
+
+    if ends_with_line_comment {
+        out.push('\n');
     }
+
     // If the result ends with an odd number of backslashes, the closing `]`
     // added by the caller would be interpreted as `\]` (an escaped bracket).
     // Append a space to break the escape sequence.
-    let trailing_backslashes = result.chars().rev().take_while(|&c| c == '\\').count();
+    let trailing_backslashes = out.chars().rev().take_while(|&c| c == '\\').count();
     if trailing_backslashes % 2 != 0 {
-        result.push(' ');
+        out.push(' ');
     }
-    result
+    out
 }
 
-fn is_label_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')
-}
-
-fn extract_citation_key_at_cursor<'a>(
-    rest: &'a str,
+fn escape_node(
+    node: &SyntaxNode,
+    in_markup: bool,
+    escape_refs: bool,
     citation_keys: &BTreeSet<String>,
-) -> Option<&'a str> {
-    if rest.starts_with('<') {
-        let end = rest.find('>')?;
-        let key = &rest[1..end];
-        if citation_keys.contains(key) {
-            return Some(key);
+    out: &mut String,
+    ends_with_line_comment: &mut bool,
+) {
+    match node.kind() {
+        SyntaxKind::Raw
+        | SyntaxKind::Str
+        | SyntaxKind::Link
+        | SyntaxKind::Escape
+        | SyntaxKind::LineComment
+        | SyntaxKind::BlockComment => {
+            let text = node.clone().into_text();
+            if !text.is_empty() {
+                *ends_with_line_comment = node.kind() == SyntaxKind::LineComment;
+                out.push_str(&text);
+            }
         }
-        return None;
-    }
-
-    let mut len = 0;
-    for c in rest.chars() {
-        if is_label_char(c) {
-            len += c.len_utf8();
-        } else {
-            break;
+        SyntaxKind::Markup => {
+            let mut open_brackets: Vec<usize> = Vec::new();
+            for child in node.children() {
+                if child.kind() == SyntaxKind::Text {
+                    for ch in child.text().chars() {
+                        match ch {
+                            '[' => {
+                                open_brackets.push(out.len());
+                                out.push('[');
+                            }
+                            ']' => {
+                                if open_brackets.pop().is_some() {
+                                    out.push(']');
+                                } else {
+                                    out.push_str("\\]");
+                                }
+                            }
+                            _ => out.push(ch),
+                        }
+                        *ends_with_line_comment = false;
+                    }
+                } else {
+                    escape_node(
+                        child,
+                        true,
+                        escape_refs,
+                        citation_keys,
+                        out,
+                        ends_with_line_comment,
+                    );
+                }
+            }
+            for pos in open_brackets.into_iter().rev() {
+                out.insert(pos, '\\');
+            }
+        }
+        SyntaxKind::ContentBlock => {
+            let children: Vec<_> = node.children().collect();
+            let is_closed = children
+                .last()
+                .is_some_and(|last| last.kind() == SyntaxKind::RightBracket);
+            for (idx, child) in children.iter().enumerate() {
+                if idx == 0 && child.kind() == SyntaxKind::LeftBracket && !is_closed {
+                    out.push_str("\\[");
+                    *ends_with_line_comment = false;
+                } else {
+                    escape_node(
+                        child,
+                        true,
+                        escape_refs,
+                        citation_keys,
+                        out,
+                        ends_with_line_comment,
+                    );
+                }
+            }
+        }
+        SyntaxKind::Strong
+        | SyntaxKind::Emph
+        | SyntaxKind::Heading
+        | SyntaxKind::ListItem
+        | SyntaxKind::EnumItem
+        | SyntaxKind::TermItem
+        | SyntaxKind::Ref => {
+            for child in node.children() {
+                escape_node(
+                    child,
+                    true,
+                    escape_refs,
+                    citation_keys,
+                    out,
+                    ends_with_line_comment,
+                );
+            }
+        }
+        SyntaxKind::Label if in_markup && escape_refs => {
+            out.push('\\');
+            out.push_str(node.text());
+            *ends_with_line_comment = false;
+        }
+        SyntaxKind::RefMarker if in_markup && escape_refs => {
+            let text = node.text();
+            let key = text.strip_prefix('@').unwrap_or(text.as_str());
+            if citation_keys.contains(key) {
+                out.push_str(text);
+            } else {
+                out.push('\\');
+                out.push_str(text);
+            }
+            *ends_with_line_comment = false;
+        }
+        SyntaxKind::Error if in_markup && node.text().as_str() == "]" => {
+            out.push_str("\\]");
+            *ends_with_line_comment = false;
+        }
+        _ => {
+            let mut has_children = false;
+            for child in node.children() {
+                has_children = true;
+                // Only Markup/ContentBlock/markup containers stay in markup mode;
+                // code expressions and equations switch out of markup mode.
+                escape_node(
+                    child,
+                    false,
+                    escape_refs,
+                    citation_keys,
+                    out,
+                    ends_with_line_comment,
+                );
+            }
+            if !has_children {
+                let text = node.text();
+                if !text.is_empty() {
+                    out.push_str(text);
+                    *ends_with_line_comment = false;
+                }
+            }
         }
     }
-    if len == 0 {
-        return None;
-    }
-    let candidate = &rest[..len];
-    if citation_keys.contains(candidate) {
-        return Some(candidate);
-    }
-    let trimmed = candidate.trim_end_matches(['.', ':']);
-    if !trimmed.is_empty() && citation_keys.contains(trimmed) {
-        return Some(trimmed);
-    }
-    None
-}
-
-/// True when `label_start` points at the `<` in the first argument to `#ref(...)` or `#cite(...)`,
-/// or when the label ID is a known citation key.
-fn is_ref_or_cite_label_arg(
-    s: &str,
-    label_start: usize,
-    citation_keys: &BTreeSet<String>,
-) -> bool {
-    let Some(label_len) = TypstLabel::end(&s[label_start..]) else {
-        return false;
-    };
-    let label_id = &s[label_start + 1..label_start + label_len - 1];
-    if citation_keys.contains(label_id) {
-        return true;
-    }
-
-    s[..label_start]
-        .trim_end()
-        .strip_suffix('(')
-        .is_some_and(|prefix| {
-            let p = prefix.trim_end();
-            p.ends_with("#ref") || p.ends_with("#cite")
-        })
 }
 
 #[cfg(test)]
@@ -531,6 +598,66 @@ mod tests {
         assert_eq!(
             escape("compare #ref(<tbl-cobalt-notes>, supplement: [])", true),
             "compare #ref(<tbl-cobalt-notes>, supplement: [])"
+        );
+    }
+
+    #[test]
+    fn test_escape_content_custom_func_label_args_not_escaped() {
+        assert_eq!(
+            escape("#Fig(<fig:EddyingCPS_uyz>)", true),
+            "#Fig(<fig:EddyingCPS_uyz>)"
+        );
+        assert_eq!(
+            escape("#Figure(<fig:QBOASH_mimjja>)", true),
+            "#Figure(<fig:QBOASH_mimjja>)"
+        );
+        assert_eq!(
+            escape("#Fig(<fig:a>, <fig:b>) and #Table(<tab:1>) and #Eq(<eq:1>)", true),
+            "#Fig(<fig:a>, <fig:b>) and #Table(<tab:1>) and #Eq(<eq:1>)"
+        );
+        assert_eq!(
+            escape("#ref(<tbl:1>, supplement: [see <inner> and @other])", true),
+            "#ref(<tbl:1>, supplement: [see \\<inner> and \\@other])"
+        );
+        assert_eq!(
+            escape("#footnote[see #Fig(<fig:kept>) and <deleted-lbl>]", true),
+            "#footnote[see #Fig(<fig:kept>) and \\<deleted-lbl>]"
+        );
+    }
+
+    #[test]
+    fn test_escape_content_raw_math_string_escape_comment_untouched() {
+        assert_eq!(
+            escape("`#Eq(<eq:COBESST2_frzpt>)` and `]`", true),
+            "`#Eq(<eq:COBESST2_frzpt>)` and `]`"
+        );
+        assert_eq!(
+            escape("$ a < b <= c $ and $ [0, 1) $", true),
+            "$ a < b <= c $ and $ [0, 1) $"
+        );
+        assert_eq!(
+            escape(r#"#text("a@b]c<d>")"#, true),
+            r#"#text("a@b]c<d>")"#
+        );
+        assert_eq!(
+            escape(r"a \] b \[ c \@ d \<e>", true),
+            r"a \] b \[ c \@ d \<e>"
+        );
+        assert_eq!(
+            escape(r"a \\] b", false),
+            r"a \\\] b"
+        );
+        assert_eq!(
+            escape("a ] b [ c", false),
+            r"a \] b \[ c"
+        );
+        assert_eq!(
+            escape("a [ b [ c ] d", false),
+            r"a \[ b [ c ] d"
+        );
+        assert_eq!(
+            escape("heading // comment", false),
+            "heading // comment\n"
         );
     }
 
